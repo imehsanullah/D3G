@@ -9,12 +9,13 @@ import metrics.oi_eval
 
 class GraphEvaluator(DatasetEvaluator):
     
-    def __init__(self, dataset_name, output_dir=None, thresh=0.3, det_only=False) -> None:
+    def __init__(self, dataset_name, output_dir=None, thresh=0.3, det_only=False, save_all=False) -> None:
         super().__init__()
         self.output_dir = output_dir
         self.dataset_name = dataset_name
         self.classless = 'real' in self.dataset_name 
         self.threshold = thresh
+        self.save_all = save_all
         mkw = {'sync_on_compute': False}
         self.m_ap = MeanAveragePrecision(**mkw)
         self.m_ap_classless = MeanAveragePrecision(extended_summary=True, **mkw)
@@ -24,6 +25,7 @@ class GraphEvaluator(DatasetEvaluator):
         
         self.det_only = det_only
         self.ap_prep_list = []
+        self.save_list = []
                 
     def reset(self):
         self.m_ap.reset()

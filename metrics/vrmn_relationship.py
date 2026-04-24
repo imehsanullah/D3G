@@ -124,6 +124,8 @@ class RelationshipEval(nn.Module):
         self.results = []
         
     def compute_sum(self,):
+        if len(self.results) == 0:
+            return {'true_positive': 0, 'false_positive': 0, 'ngt_rel': 0, 'all_correct': 0}
         return {k: float(sum(map(lambda x: x[k], self.results))) for k in self.results[0]} 
     
     def compute(self):
@@ -133,10 +135,14 @@ class RelationshipEval(nn.Module):
             o_prec = acc_res['true_positive'] / (acc_res['true_positive'] + acc_res['false_positive'])
         else:
             o_prec = 0
-        o_rec = acc_res['true_positive'] / acc_res['ngt_rel']
+        
+        if acc_res.get('ngt_rel', 0) > 0:
+            o_rec = acc_res['true_positive'] / acc_res['ngt_rel']
+        else:
+            o_rec = 0.0
         
         
-        img_acc = acc_res['all_correct'] / len(self.results)
+        img_acc = acc_res['all_correct'] / len(self.results) if len(self.results) > 0 else 0.0
         
         return {
             'OP': o_prec, # Precision over all relations
