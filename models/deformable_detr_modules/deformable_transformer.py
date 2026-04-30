@@ -123,7 +123,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, return_qk=False):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, return_qk=False, return_memory=False):
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
@@ -187,12 +187,17 @@ class DeformableTransformer(nn.Module):
         inter_references_out = inter_references
         if return_qk:
             if self.two_stage:
-                return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact, qk
-            return hs, init_reference_out, inter_references_out, None, None, qk
+                result = (hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact, qk)
+            else:
+                result = (hs, init_reference_out, inter_references_out, None, None, qk)
         else:
             if self.two_stage:
-                return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
-            return hs, init_reference_out, inter_references_out, None, None
+                result = (hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact)
+            else:
+                result = (hs, init_reference_out, inter_references_out, None, None)
+        if return_memory:
+            return (*result, memory, spatial_shapes, level_start_index)
+        return result
             
 
 
@@ -415,5 +420,4 @@ def build_deforamble_transformer(args):
         enc_n_points=args.enc_n_points,
         two_stage=args.two_stage,
         two_stage_num_proposals=args.num_queries)
-
 

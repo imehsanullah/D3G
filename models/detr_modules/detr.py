@@ -65,6 +65,7 @@ class DETR(nn.Module):
 
         outputs_class = self.class_embed(hs)
         outputs_coord = self.bbox_embed(hs).sigmoid()
+        outputs_coord = torch.nan_to_num(outputs_coord, nan=0.5, posinf=1.0, neginf=0.0).clamp(0, 1)
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)

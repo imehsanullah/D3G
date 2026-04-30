@@ -3,7 +3,7 @@ from models.deformable_detr_modules.backbone import Joiner, build_backbone
 from models.deformable_detr_modules.deformable_detr import MLP, SetCriterion
 from models.deformable_detr_modules.matcher import HungarianMatcher
 from models.deformable_detr_modules.position_encoding import PositionEmbeddingSine
-from models.deformable_detr_modules.segmentation import PostProcessSegm
+from models.deformable_detr_modules.segmentation import MHAttentionMap, MaskHeadSmallConv, PostProcessSegm
 from models.deformable_detr_modules.deformable_transformer import DeformableTransformer
 from utils.box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh
 from utils.fb_misc import (NestedTensor, nested_tensor_from_tensor_list,
@@ -198,6 +198,98 @@ class DEFDETR(nn.Module):
                                 )]
 
 
+class DeformableDETRSegm(nn.Module):
+    def __init__(self, detr, freeze_detr=False):
+        super().__init__()
+        self.detr = detr
+
+        if freeze_detr:
+            for p in self.detr.parameters():
+                p.requires_grad_(False)
+
+        hidden_dim = detr.transformer.d_model
+        nheads = detr.transformer.nhead
+        self.bbox_attention = MHAttentionMap(hidden_dim, hidden_dim, nheads, dropout=0)
+        self.mask_head = MaskHeadSmallConv(hidden_dim + nheads, [2048, 1024, 512], hidden_dim)
+
+    def forward(self, samples: NestedTensor):
+        if not isinstance(samples, NestedTensor):
+            samples = nested_tensor_from_tensor_list(samples)
+        features, pos = self.detr.backbone(samples)
+
+        srcs = []
+        masks = []
+        for l, feat in enumerate(features):
+            src, mask = feat.decompose()
+            srcs.append(self.detr.input_proj[l](src))
+            masks.append(mask)
+            assert mask is not None
+        if self.detr.num_feature_levels > len(srcs):
+            len_srcs = len(srcs)
+            for l in range(len_srcs, self.detr.num_feature_levels):
+                if l == len_srcs:
+                    src = self.detr.input_proj[l](features[-1].tensors)
+                else:
+                    src = self.detr.input_proj[l](srcs[-1])
+                m = samples.mask
+                mask = nF.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                pos_l = self.detr.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                srcs.append(src)
+                masks.append(mask)
+                pos.append(pos_l)
+
+        query_embeds = None
+        if not self.detr.two_stage:
+            query_embeds = self.detr.query_embed.weight
+        (
+            hs,
+            init_reference,
+            inter_references,
+            enc_outputs_class,
+            enc_outputs_coord_unact,
+            memory,
+            spatial_shapes,
+            level_start_index,
+        ) = self.detr.transformer(srcs, masks, pos, query_embeds, return_memory=True)
+
+        outputs_classes = []
+        outputs_coords = []
+        for lvl in range(hs.shape[0]):
+            if lvl == 0:
+                reference = init_reference
+            else:
+                reference = inter_references[lvl - 1]
+            reference = inverse_sigmoid(reference)
+            outputs_class = self.detr.class_embed[lvl](hs[lvl])
+            tmp = self.detr.bbox_embed[lvl](hs[lvl])
+            if reference.shape[-1] == 4:
+                tmp += reference
+            else:
+                assert reference.shape[-1] == 2
+                tmp[..., :2] += reference
+            outputs_coord = tmp.sigmoid()
+            outputs_classes.append(outputs_class)
+            outputs_coords.append(outputs_coord)
+        outputs_class = torch.stack(outputs_classes)
+        outputs_coord = torch.stack(outputs_coords)
+
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        if self.detr.aux_loss:
+            out['aux_outputs'] = self.detr._set_aux_loss(outputs_class, outputs_coord)
+        if self.detr.two_stage:
+            enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
+            out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
+
+        mask_level = len(features) - 1
+        h, w = spatial_shapes[mask_level]
+        start = level_start_index[mask_level]
+        memory_level = memory[:, start:start + h * w, :].transpose(1, 2).reshape(memory.shape[0], -1, h, w)
+        bbox_mask = self.bbox_attention(hs[-1], memory_level, mask=masks[mask_level])
+        seg_masks = self.mask_head(memory_level, bbox_mask, [features[2].tensors, features[1].tensors, features[0].tensors])
+        out["pred_masks"] = seg_masks.view(memory.shape[0], self.detr.num_queries, seg_masks.shape[-2], seg_masks.shape[-1])
+        return out
+
+
 
 @META_ARCH_REGISTRY.register()
 class DeformableDetr(nn.Module):
@@ -271,7 +363,7 @@ class DeformableDetr(nn.Module):
                 del weight
                 self.detr.load_state_dict(new_weight)
                 del new_weight
-            self.detr = GRAPHDETRSegm(self.detr, freeze_detr=(frozen_weights != ''))
+            self.detr = DeformableDETRSegm(self.detr, freeze_detr=(frozen_weights != ''))
             self.seg_postprocess = PostProcessSegm
 
         self.detr.to(self.device)
@@ -409,4 +501,3 @@ class DeformableDetr(nn.Module):
         images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
         images = ImageList.from_tensors(images)
         return images
-

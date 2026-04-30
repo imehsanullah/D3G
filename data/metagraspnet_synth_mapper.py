@@ -68,9 +68,6 @@ def get_metagraspnet_dict_synth(split='all', cache_dir=cache_dir):
     sample = sample_metadata[sample_metadata['scene'].isin(scene_ix)]
     sample = sample[sample['num_objects'] > 1]
 
-    # Filter to only include scenes 0-99 that we have extracted
-    sample = sample[sample['scene'] < 100]
-
     return sample.to_dict('records')
     
 
