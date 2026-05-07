@@ -6,9 +6,9 @@ smoke/debug helper for the Option 2A `MemGraphDenseKnownNodes` prototype.
 
 Default safety boundary:
 - explicit records JSON/JSONL only;
-- max 5 records;
+- max 100 records for the approved Stage 5B local debug split;
 - batch size 1 only;
-- CPU only in this first implementation;
+- CPU or explicitly requested local CUDA device;
 - checkpoint/model-output writes disabled;
 - no HDF5 packing or full dataset export;
 - requires explicit acknowledgement flags before running backward/optimizer.
@@ -37,8 +37,12 @@ from models.mem_graph_dense import MemGraphDenseKnownNodes
 from utils.configs import add_dep_graph_config, add_detr_config
 
 
-MAX_RECORDS = 5
+MAX_RECORDS = 100
 MAX_ITER_CAP = 200
+DEFAULT_LOSS_MODE = "bce"
+LOSS_MODES = ("bce", "train_pos_weighted_bce")
+DEFAULT_DIAGNOSTIC_THRESHOLDS = (0.03, 0.05, 0.07, 0.09, 0.10, 0.12, 0.15, 0.20, 0.30, 0.50)
+DEFAULT_HISTOGRAM_BIN_EDGES = (0.0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.30, 0.50, 1.0)
 DEFAULT_CONFIG_FILE = REPO_ROOT / "configs" / "mem" / "option2a_known_nodes_graph_smoke.yaml"
 SCHEMA = "mem_d3g_known_node_tiny_train_debug_summary_v0"
 
@@ -112,6 +116,75 @@ def summarize_edge_targets(target: Any) -> Dict[str, Any]:
     }
 
 
+def aggregate_edge_target_summaries(summaries: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    num_pairs = int(sum(int(summary["num_non_diagonal_pairs"]) for summary in summaries))
+    num_positive = int(sum(int(summary["num_positive_directed_edges"]) for summary in summaries))
+    num_negative = int(num_pairs - num_positive)
+    return {
+        "num_records": int(len(summaries)),
+        "num_non_diagonal_pairs": num_pairs,
+        "num_positive_directed_edges": num_positive,
+        "num_negative_directed_edges": num_negative,
+        "positive_edge_ratio": float(num_positive / num_pairs) if num_pairs else None,
+        "negative_positive_ratio": float(num_negative / num_positive) if num_positive else None,
+    }
+
+
+def _normalise_loss_mode(loss_mode: str) -> str:
+    value = str(loss_mode or DEFAULT_LOSS_MODE)
+    if value not in LOSS_MODES:
+        raise ValueError("loss_mode must be one of {}; got {!r}".format(", ".join(LOSS_MODES), value))
+    return value
+
+
+def _normalise_training_device(device: str) -> str:
+    value = str(device or "cpu").strip().lower()
+    if value == "cpu":
+        return "cpu"
+    if value == "cuda":
+        value = "cuda:0"
+    if value.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise ValueError("CUDA device requested but torch.cuda.is_available() is False")
+        index_text = value.split(":", 1)[1]
+        try:
+            index = int(index_text)
+        except ValueError as exc:
+            raise ValueError("CUDA device index must be an integer; got {!r}".format(index_text)) from exc
+        device_count = int(torch.cuda.device_count())
+        if index < 0 or index >= device_count:
+            raise ValueError("CUDA device index {} unavailable; torch reports {} CUDA device(s)".format(index, device_count))
+        return "cuda:{}".format(index)
+    raise ValueError("device must be 'cpu', 'cuda', or 'cuda:<index>'; got {!r}".format(device))
+
+
+def _cuda_device_summary(device: str) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        "torch_cuda_available": bool(torch.cuda.is_available()),
+        "torch_cuda_device_count": int(torch.cuda.device_count()),
+    }
+    if str(device).startswith("cuda:"):
+        index = int(str(device).split(":", 1)[1])
+        summary["cuda_device_index"] = index
+        summary["cuda_device_name"] = torch.cuda.get_device_name(index)
+    return summary
+
+
+def _resolve_graph_loss_pos_weight(loss_mode: str, train_aggregate_target_summary: Dict[str, Any]) -> Dict[str, Any]:
+    loss_mode = _normalise_loss_mode(loss_mode)
+    if loss_mode == "bce":
+        return {"value": 0.0, "source": "unweighted_bce"}
+
+    num_positive = int(train_aggregate_target_summary["num_positive_directed_edges"])
+    num_negative = int(train_aggregate_target_summary["num_negative_directed_edges"])
+    if num_positive <= 0:
+        raise ValueError("train_pos_weighted_bce requires at least one positive train edge")
+    value = num_negative / float(num_positive)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("computed graph loss pos_weight must be finite and positive")
+    return {"value": float(value), "source": "train_split_negative_positive_ratio"}
+
+
 def summarize_logits_by_target(logits: Any, target: Any) -> Dict[str, Any]:
     logits_tensor = _as_tensor(logits)
     target_tensor = _as_tensor(target)
@@ -134,36 +207,152 @@ def summarize_logits_by_target(logits: Any, target: Any) -> Dict[str, Any]:
     }
 
 
-def compute_binary_metrics_at_threshold(logits: Any, target: Any, threshold: float = 0.5) -> Dict[str, Any]:
+def _normalise_thresholds(thresholds: Optional[Sequence[float]]) -> List[float]:
+    values = [float(value) for value in (thresholds or DEFAULT_DIAGNOSTIC_THRESHOLDS)]
+    if not values:
+        raise ValueError("at least one diagnostic threshold is required")
+    for value in values:
+        if value < 0.0 or value > 1.0:
+            raise ValueError("diagnostic thresholds must be within [0,1]")
+    return values
+
+
+def _normalise_histogram_bin_edges(bin_edges: Optional[Sequence[float]]) -> List[float]:
+    values = [float(value) for value in (bin_edges or DEFAULT_HISTOGRAM_BIN_EDGES)]
+    if len(values) < 2:
+        raise ValueError("histogram_bin_edges must contain at least two values")
+    if values[0] < 0.0 or values[-1] > 1.0:
+        raise ValueError("histogram_bin_edges must stay within [0,1]")
+    if any(right <= left for left, right in zip(values, values[1:])):
+        raise ValueError("histogram_bin_edges must be strictly increasing")
+    return values
+
+
+def extract_non_diagonal_probabilities_and_labels(logits: Any, target: Any) -> Dict[str, List[float]]:
     logits_tensor = _as_tensor(logits)
     target_tensor = _as_tensor(target)
     if logits_tensor.shape != target_tensor.shape:
         raise ValueError("logits and target must have matching shapes")
     mask = compute_non_diagonal_mask(target_tensor)
-    probabilities = torch.sigmoid(logits_tensor[mask])
-    labels = target_tensor[mask].long()
-    predictions = (probabilities >= float(threshold)).long()
+    probabilities = torch.sigmoid(logits_tensor[mask]).detach().cpu().tolist()
+    labels = target_tensor[mask].long().detach().cpu().tolist()
+    return {"scores": [float(value) for value in probabilities], "labels": [int(value) for value in labels]}
 
-    tp = int(((predictions == 1) & (labels == 1)).sum().item())
-    fp = int(((predictions == 1) & (labels == 0)).sum().item())
-    tn = int(((predictions == 0) & (labels == 0)).sum().item())
-    fn = int(((predictions == 0) & (labels == 1)).sum().item())
+
+def compute_binary_metrics_from_scores(scores: Sequence[float], labels: Sequence[int], threshold: float = 0.5) -> Dict[str, Any]:
+    score_list = [float(score) for score in scores]
+    label_list = [int(label) for label in labels]
+    if len(score_list) != len(label_list):
+        raise ValueError("scores and labels must have matching lengths")
+    if any(label not in (0, 1) for label in label_list):
+        raise ValueError("labels must be binary 0/1 values")
+    threshold = float(threshold)
+    predictions = [1 if score >= threshold else 0 for score in score_list]
+    tp = sum(1 for pred, label in zip(predictions, label_list) if pred == 1 and label == 1)
+    fp = sum(1 for pred, label in zip(predictions, label_list) if pred == 1 and label == 0)
+    tn = sum(1 for pred, label in zip(predictions, label_list) if pred == 0 and label == 0)
+    fn = sum(1 for pred, label in zip(predictions, label_list) if pred == 0 and label == 1)
     precision = tp / float(tp + fp) if (tp + fp) else 0.0
     recall = tp / float(tp + fn) if (tp + fn) else 0.0
     f1 = (2.0 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
-    ap = compute_average_precision(probabilities.detach().cpu().tolist(), labels.detach().cpu().tolist())
+    ap = compute_average_precision(score_list, label_list)
     return {
-        "threshold": float(threshold),
-        "num_pairs": int(labels.numel()),
-        "true_positive": tp,
-        "false_positive": fp,
-        "true_negative": tn,
-        "false_negative": fn,
+        "threshold": threshold,
+        "num_pairs": int(len(label_list)),
+        "true_positive": int(tp),
+        "false_positive": int(fp),
+        "true_negative": int(tn),
+        "false_negative": int(fn),
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
         "average_precision": ap,
     }
+
+
+def compute_probability_histogram(
+    scores: Sequence[float], labels: Sequence[int], bin_edges: Optional[Sequence[float]] = None
+) -> Dict[str, Any]:
+    score_list = [float(score) for score in scores]
+    label_list = [int(label) for label in labels]
+    if len(score_list) != len(label_list):
+        raise ValueError("scores and labels must have matching lengths")
+    if any(label not in (0, 1) for label in label_list):
+        raise ValueError("labels must be binary 0/1 values")
+    edges = _normalise_histogram_bin_edges(bin_edges)
+    positive_counts = [0 for _ in range(len(edges) - 1)]
+    negative_counts = [0 for _ in range(len(edges) - 1)]
+    for score, label in zip(score_list, label_list):
+        if score < edges[0] or score > edges[-1]:
+            raise ValueError("score {} falls outside histogram range [{},{}]".format(score, edges[0], edges[-1]))
+        bin_index = len(edges) - 2
+        for index, (left, right) in enumerate(zip(edges, edges[1:])):
+            if left <= score < right or (index == len(edges) - 2 and score <= right):
+                bin_index = index
+                break
+        if label == 1:
+            positive_counts[bin_index] += 1
+        else:
+            negative_counts[bin_index] += 1
+    return {
+        "bin_edges": edges,
+        "positive_counts": positive_counts,
+        "negative_counts": negative_counts,
+        "total_counts": [int(pos + neg) for pos, neg in zip(positive_counts, negative_counts)],
+    }
+
+
+def compute_score_distribution_diagnostics(
+    scores: Sequence[float],
+    labels: Sequence[int],
+    thresholds: Optional[Sequence[float]] = None,
+    bin_edges: Optional[Sequence[float]] = None,
+) -> Dict[str, Any]:
+    score_list = [float(score) for score in scores]
+    label_list = [int(label) for label in labels]
+    if len(score_list) != len(label_list):
+        raise ValueError("scores and labels must have matching lengths")
+    if any(label not in (0, 1) for label in label_list):
+        raise ValueError("labels must be binary 0/1 values")
+    positive_scores = [score for score, label in zip(score_list, label_list) if label == 1]
+    negative_scores = [score for score, label in zip(score_list, label_list) if label == 0]
+    thresholds = _normalise_thresholds(thresholds)
+    threshold_sweep = [compute_binary_metrics_from_scores(score_list, label_list, threshold) for threshold in thresholds]
+    best_f1 = None
+    if threshold_sweep:
+        best_f1 = max(
+            threshold_sweep,
+            key=lambda item: (item["f1"], item["recall"], item["precision"], -item["threshold"]),
+        )
+    num_pairs = len(label_list)
+    num_positive = len(positive_scores)
+    num_negative = len(negative_scores)
+    mean_positive = sum(positive_scores) / num_positive if num_positive else None
+    mean_negative = sum(negative_scores) / num_negative if num_negative else None
+    positive_edge_ratio = num_positive / float(num_pairs) if num_pairs else None
+    ap = compute_average_precision(score_list, label_list)
+    ap_over_base_rate = (ap / positive_edge_ratio) if ap is not None and positive_edge_ratio else None
+    return {
+        "num_pairs": int(num_pairs),
+        "num_positive": int(num_positive),
+        "num_negative": int(num_negative),
+        "positive_edge_ratio": positive_edge_ratio,
+        "average_precision": ap,
+        "average_precision_over_base_rate": ap_over_base_rate,
+        "mean_positive_probability": mean_positive,
+        "mean_negative_probability": mean_negative,
+        "mean_positive_minus_negative_probability": (mean_positive - mean_negative)
+        if mean_positive is not None and mean_negative is not None
+        else None,
+        "threshold_sweep": threshold_sweep,
+        "best_f1_threshold": best_f1,
+        "probability_histogram": compute_probability_histogram(score_list, label_list, bin_edges),
+    }
+
+
+def compute_binary_metrics_at_threshold(logits: Any, target: Any, threshold: float = 0.5) -> Dict[str, Any]:
+    selected = extract_non_diagonal_probabilities_and_labels(logits, target)
+    return compute_binary_metrics_from_scores(selected["scores"], selected["labels"], threshold=threshold)
 
 
 def build_mem_graph_dense_known_nodes_tiny_train_cfg(
@@ -172,8 +361,7 @@ def build_mem_graph_dense_known_nodes_tiny_train_cfg(
     device: str = "cpu",
     cfg_overrides: Optional[Sequence[str]] = None,
 ):
-    if device != "cpu":
-        raise ValueError("tiny train/debug wrapper is CPU-only in this first implementation")
+    device = _normalise_training_device(device)
     cfg = get_cfg()
     add_dep_graph_config(cfg)
     add_detr_config(cfg)
@@ -205,8 +393,7 @@ def _validate_safety_inputs(
         raise ValueError("max_records must be between 1 and {}".format(MAX_RECORDS))
     if max_iter < 1 or max_iter > MAX_ITER_CAP:
         raise ValueError("max_iter must be between 1 and {} for this tiny debug wrapper".format(MAX_ITER_CAP))
-    if device != "cpu":
-        raise ValueError("tiny train/debug wrapper is CPU-only in this first implementation")
+    device = _normalise_training_device(device)
     if not no_checkpoint:
         raise ValueError("checkpoint/model-output writes are disabled; pass no_checkpoint=True for this wrapper")
     if not acknowledge_backward or not acknowledge_optimizer_step:
@@ -260,7 +447,7 @@ def _total_gradient_norm(model: torch.nn.Module) -> Dict[str, Any]:
     return {"value": float(total), "finite": bool(math.isfinite(total) and finite), "saw_grad": bool(saw_grad)}
 
 
-def _eval_one_record(model: MemGraphDenseKnownNodes, mapped: Dict[str, Any], *, threshold: float = 0.5) -> Dict[str, Any]:
+def _eval_logits_and_target(model: MemGraphDenseKnownNodes, mapped: Dict[str, Any]) -> tuple:
     was_training = model.training
     model.eval()
     with torch.no_grad():
@@ -272,12 +459,38 @@ def _eval_one_record(model: MemGraphDenseKnownNodes, mapped: Dict[str, Any], *, 
     output = outputs[0]
     logits = output["graph_logits"].detach().cpu()
     target = mapped["graph_gt"].detach().cpu()
-    return {
+    return logits, target
+
+
+def _eval_one_record(
+    model: MemGraphDenseKnownNodes,
+    mapped: Dict[str, Any],
+    *,
+    threshold: float = 0.5,
+    rich_diagnostics: bool = False,
+    diagnostic_thresholds: Optional[Sequence[float]] = None,
+    histogram_bin_edges: Optional[Sequence[float]] = None,
+) -> Dict[str, Any]:
+    logits, target = _eval_logits_and_target(model, mapped)
+    summary = {
         "image_id": mapped.get("image_id"),
         "target_summary": summarize_edge_targets(target),
         "logit_summary": summarize_logits_by_target(logits, target),
         "metrics_at_threshold_0_5": compute_binary_metrics_at_threshold(logits, target, threshold=threshold),
     }
+    if rich_diagnostics:
+        selected = extract_non_diagonal_probabilities_and_labels(logits, target)
+        diagnostics = compute_score_distribution_diagnostics(
+            selected["scores"],
+            selected["labels"],
+            thresholds=diagnostic_thresholds,
+            bin_edges=histogram_bin_edges,
+        )
+        summary["score_distribution_diagnostics"] = diagnostics
+        summary["threshold_sweep"] = diagnostics["threshold_sweep"]
+        summary["best_f1_threshold"] = diagnostics["best_f1_threshold"]
+        summary["probability_histogram"] = diagnostics["probability_histogram"]
+    return summary
 
 
 def _write_summary_json(output_dir: Path, summary: Dict[str, Any]) -> None:
@@ -300,15 +513,20 @@ def build_mem_graph_dense_known_nodes_tiny_train_summary(
     seed: int = 0,
     max_iter: int = 1,
     lr: float = 1e-4,
+    loss_mode: str = DEFAULT_LOSS_MODE,
     output_dir: Optional[Path] = None,
     no_checkpoint: bool = True,
     acknowledge_backward: bool = False,
     acknowledge_optimizer_step: bool = False,
+    include_rich_diagnostics: bool = False,
+    diagnostic_thresholds: Optional[Sequence[float]] = None,
+    histogram_bin_edges: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     """Run a capped tiny train/debug loop and return a compact JSON summary."""
 
     records_json = Path(records_json).expanduser()
     output_dir = _as_path(output_dir)
+    device = _normalise_training_device(device)
     _validate_safety_inputs(
         max_records=int(max_records),
         max_iter=int(max_iter),
@@ -320,8 +538,11 @@ def build_mem_graph_dense_known_nodes_tiny_train_summary(
     )
     if lr <= 0:
         raise ValueError("lr must be positive")
+    loss_mode = _normalise_loss_mode(loss_mode)
 
     torch.manual_seed(int(seed))
+    if str(device).startswith("cuda:"):
+        torch.cuda.manual_seed_all(int(seed))
     cfg = build_mem_graph_dense_known_nodes_tiny_train_cfg(config_file, device=device, cfg_overrides=cfg_overrides)
     records = load_mem_observed_gt_records(records_json, max_records=max_records)
     if not records:
@@ -342,12 +563,16 @@ def build_mem_graph_dense_known_nodes_tiny_train_summary(
     train_mapped = [mapper(record) for record in train_records]
     val_mapped = [mapper(record) for record in val_records]
 
-    model = MemGraphDenseKnownNodes(cfg)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr))
-
     train_target_summaries = [
         {"image_id": mapped.get("image_id"), **summarize_edge_targets(mapped["graph_gt"])} for mapped in train_mapped
     ]
+    train_aggregate_target_summary = aggregate_edge_target_summaries(train_target_summaries)
+    graph_loss_pos_weight = _resolve_graph_loss_pos_weight(loss_mode, train_aggregate_target_summary)
+    cfg.MODEL.MEM_GRAPH.GRAPH_LOSS_POS_WEIGHT = float(graph_loss_pos_weight["value"])
+
+    model = MemGraphDenseKnownNodes(cfg)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(lr))
+
     train_iterations: List[Dict[str, Any]] = []
 
     for iteration in range(int(max_iter)):
@@ -381,13 +606,39 @@ def build_mem_graph_dense_known_nodes_tiny_train_summary(
             }
         )
 
-    validation_summaries = [_eval_one_record(model, mapped) for mapped in val_mapped]
+    validation_summaries = [
+        _eval_one_record(
+            model,
+            mapped,
+            rich_diagnostics=include_rich_diagnostics,
+            diagnostic_thresholds=diagnostic_thresholds,
+            histogram_bin_edges=histogram_bin_edges,
+        )
+        for mapped in val_mapped
+    ]
+    validation_aggregate_diagnostics = None
+    if include_rich_diagnostics and val_mapped:
+        aggregate_scores: List[float] = []
+        aggregate_labels: List[int] = []
+        for mapped in val_mapped:
+            logits, target = _eval_logits_and_target(model, mapped)
+            selected = extract_non_diagonal_probabilities_and_labels(logits, target)
+            aggregate_scores.extend(selected["scores"])
+            aggregate_labels.extend(selected["labels"])
+        validation_aggregate_diagnostics = compute_score_distribution_diagnostics(
+            aggregate_scores,
+            aggregate_labels,
+            thresholds=diagnostic_thresholds,
+            bin_edges=histogram_bin_edges,
+        )
+        validation_aggregate_diagnostics["num_records"] = len(val_mapped)
 
     summary = {
         "schema": SCHEMA,
         "hostname": socket.gethostname(),
         "python_executable": sys.executable,
         "torch_version": torch.__version__,
+        **_cuda_device_summary(device),
         "records_json": str(records_json),
         "data_root": str(data_root),
         "config_file": str(_as_path(config_file)) if config_file is not None else None,
@@ -395,6 +646,9 @@ def build_mem_graph_dense_known_nodes_tiny_train_summary(
         "seed": int(seed),
         "optimizer": "AdamW",
         "lr": float(lr),
+        "loss_mode": loss_mode,
+        "graph_loss_pos_weight": float(graph_loss_pos_weight["value"]),
+        "graph_loss_pos_weight_source": str(graph_loss_pos_weight["source"]),
         "max_iter": int(max_iter),
         "max_records": int(max_records),
         "num_records_loaded": len(records),
@@ -403,8 +657,13 @@ def build_mem_graph_dense_known_nodes_tiny_train_summary(
         "train_sample_ids": [str(record.get("sample_id")) for record in train_records],
         "val_sample_ids": [str(record.get("sample_id")) for record in val_records],
         "train_target_summaries": train_target_summaries,
+        "train_aggregate_target_summary": train_aggregate_target_summary,
         "train_iterations": train_iterations,
         "validation_summaries": validation_summaries,
+        "validation_aggregate_diagnostics": validation_aggregate_diagnostics,
+        "rich_diagnostics_enabled": bool(include_rich_diagnostics),
+        "diagnostic_thresholds": _normalise_thresholds(diagnostic_thresholds) if include_rich_diagnostics else None,
+        "histogram_bin_edges": _normalise_histogram_bin_edges(histogram_bin_edges) if include_rich_diagnostics else None,
         "output_dir": str(output_dir) if output_dir is not None else None,
         "checkpoint_policy": "disabled/no_checkpoint_required",
         "safety": {
@@ -417,6 +676,7 @@ def build_mem_graph_dense_known_nodes_tiny_train_summary(
             "max_iter_cap": MAX_ITER_CAP,
             "batch_size": 1,
             "device": str(device),
+            "uses_cuda": str(device).startswith("cuda:"),
             "writes_hdf5_or_full_dataset": False,
             "writes_checkpoints_or_model_outputs": False,
             "writes_summary_json": output_dir is not None,
@@ -435,17 +695,44 @@ def _split_csv(value: Optional[str]) -> List[str]:
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
+def _split_float_csv(value: Optional[str]) -> Optional[List[float]]:
+    if value is None or value == "":
+        return None
+    return [float(part.strip()) for part in value.split(",") if part.strip()]
+
+
 def parse_args(argv: Sequence[str] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--records-json", type=Path, required=True, help="Explicit MEM Option 2A records JSON/JSONL")
     parser.add_argument("--data-root", default=".", help="Root for relative sample_dir values")
     parser.add_argument("--train-sample-ids", required=True, help="Comma-separated train sample ids")
     parser.add_argument("--val-sample-ids", default="", help="Comma-separated validation sample ids")
-    parser.add_argument("--max-records", type=int, default=1, help="Safety cap; 1..5")
-    parser.add_argument("--device", default="cpu", help="CPU only in this first implementation")
+    parser.add_argument("--max-records", type=int, default=1, help="Safety cap; 1..100")
+    parser.add_argument("--device", default="cpu", help="Training device for this debug wrapper: cpu, cuda, or cuda:<index>")
     parser.add_argument("--max-iter", type=int, default=1, help="Tiny iteration cap; 1..200")
     parser.add_argument("--lr", type=float, default=1e-4, help="AdamW learning rate")
+    parser.add_argument(
+        "--loss-mode",
+        choices=LOSS_MODES,
+        default=DEFAULT_LOSS_MODE,
+        help="Graph loss mode: unweighted BCE or train-split negative/positive pos_weight BCE",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Torch manual seed")
+    parser.add_argument(
+        "--include-rich-diagnostics",
+        action="store_true",
+        help="Add threshold sweeps, probability histograms, best-F1 thresholds, and aggregate validation diagnostics",
+    )
+    parser.add_argument(
+        "--diagnostic-thresholds",
+        default="",
+        help="Optional comma-separated probability thresholds; defaults focus on low uncalibrated scores",
+    )
+    parser.add_argument(
+        "--histogram-bin-edges",
+        default="",
+        help="Optional comma-separated probability histogram bin edges within [0,1]",
+    )
     parser.add_argument("--config-file", type=Path, default=DEFAULT_CONFIG_FILE, help="D3G MEM known-node config")
     parser.add_argument("--expected-height", type=int, default=140, help="Expected MEM tensor height")
     parser.add_argument("--expected-width", type=int, default=200, help="Expected MEM tensor width")
@@ -494,10 +781,14 @@ def main(argv: Sequence[str] = None) -> int:
         seed=args.seed,
         max_iter=args.max_iter,
         lr=args.lr,
+        loss_mode=args.loss_mode,
         output_dir=args.output_dir,
         no_checkpoint=args.no_checkpoint,
         acknowledge_backward=args.i_understand_this_runs_backward,
         acknowledge_optimizer_step=args.i_understand_this_runs_optimizer_step,
+        include_rich_diagnostics=args.include_rich_diagnostics,
+        diagnostic_thresholds=_split_float_csv(args.diagnostic_thresholds),
+        histogram_bin_edges=_split_float_csv(args.histogram_bin_edges),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
