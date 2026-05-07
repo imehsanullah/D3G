@@ -3,6 +3,7 @@ from .rcnn_graph import GraphRCNN
 from .rcnn_gheads import GraphHead
 from .detr import Detr
 from .detr_graph import GraphDetr
+from .mem_graph_dense import MemGraphDenseKnownNodes
 try:
     from .deformable_detr_graph import GraphDeformableDetr
     from .deformable_detr import DeformableDetr

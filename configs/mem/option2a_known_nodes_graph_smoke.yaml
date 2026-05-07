@@ -1,0 +1,47 @@
+_BASE_: '../detr_graphdense.yaml'
+
+DATASETS:
+  TRAIN: ("mem_option2a_known_nodes_graph_smoke",)
+  TEST: ("mem_option2a_known_nodes_graph_smoke",)
+  EVAL: ()
+  ROOT: "/data/manipulation_map_data/raw/map_data"
+  MEM_RECORDS_JSON: ""
+  MEM_MAX_RECORDS: 5
+
+INPUT:
+  GRAPH_GT_TYPE: "dense"
+  MEM_OBSERVED_VIEW_PROTOCOL: "uniform10"
+  MEM_MAX_SELECTED_VIEWS: 10
+  MEM_EXPECTED_HEIGHT: 140
+  MEM_EXPECTED_WIDTH: 200
+  MEM_SEMANTIC_CLASS_MIN: 0
+  MEM_SEMANTIC_CLASS_MAX: 14
+  MEM_VALIDATE_SEMANTIC_RANGE: True
+
+MODEL:
+  DEVICE: "cpu"
+  META_ARCHITECTURE: "MemGraphDenseKnownNodes"
+  MASK_ON: False
+  WEIGHTS: ""
+  MEM_GRAPH:
+    IN_CHANNELS: 30
+    HIDDEN_DIM: 256
+    NUM_OBJECT_CLASSES: 14
+    INPUT_NORMALIZATION: "scaled_v0"
+    SEMANTIC_MAX_VALUE: 14.0
+    POOLER_RESOLUTION: 3
+    GRAPH_LOSS_POS_WEIGHT: 0.0
+    MASK_GRAPH_DIAGONAL: True
+    REQUIRE_KNOWN_NODES: True
+  GRAPH_HEAD:
+    NAME: "GraphTransformerDense"
+    EDGE_FEATURES: "concat"
+    HIDDEN_DIM: 256
+    NUM_HEADS: 2
+    NUM_LAYERS: 2
+
+SOLVER:
+  IMS_PER_BATCH: 1
+
+DATALOADER:
+  NUM_WORKERS: 0
