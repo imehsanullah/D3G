@@ -20,6 +20,20 @@ from models.detr_gheads import DenseGraphTransformerHead
 
 TensorOrLoss = Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, Union[int, float, List[int]]]]]
 
+SUPPORTED_MEM_PAIR_GEOMETRY_FEATURES = (
+    "source_in_front",
+    "signed_dy",
+    "signed_dx",
+    "x_overlap_min",
+    "x_overlap_union",
+    "y_overlap_min",
+    "y_gap_norm",
+    "area_ratio_min_over_max",
+    "area_ratio",
+    "front_x_overlap_union",
+    "front_x_overlap",
+)
+
 
 def _check_dense_graph_target(target: torch.Tensor, *, require_zero_diagonal: bool) -> None:
     if target.shape[-1] != target.shape[-2]:
@@ -254,6 +268,99 @@ class MemKnownNodeTokenExtractor(nn.Module):
         return torch.stack([cx, cy, width, height], dim=1) / denom
 
 
+def _normalise_pair_geometry_feature_names(feature_names: Sequence[str]) -> Tuple[str, ...]:
+    if isinstance(feature_names, str):
+        names = [name.strip() for name in feature_names.split(",") if name.strip()]
+    else:
+        names = [str(name).strip() for name in feature_names if str(name).strip()]
+    if not names:
+        raise ValueError("PAIR_GEOMETRY_FEATURES must contain at least one feature when pair geometry is enabled")
+    unknown = sorted(set(names) - set(SUPPORTED_MEM_PAIR_GEOMETRY_FEATURES))
+    if unknown:
+        raise ValueError(
+            "unsupported MEM pair geometry feature(s): {}; supported features: {}".format(
+                unknown,
+                list(SUPPORTED_MEM_PAIR_GEOMETRY_FEATURES),
+            )
+        )
+    return tuple(names)
+
+
+def build_mem_pair_geometry_features(instances: Instances, feature_names: Sequence[str]) -> torch.Tensor:
+    """Build directed pair geometry features from mapper-provided node boxes.
+
+    The returned tensor has shape ``[N, N, F]``. Entry ``[i, j]`` describes the
+    directed pair source ``i`` -> target ``j`` using normalized box geometry in
+    image coordinates, where lower y values are interpreted as closer to shelf
+    access/front.
+    """
+
+    names = _normalise_pair_geometry_feature_names(feature_names)
+    if not instances.has("gt_boxes"):
+        raise ValueError("pair geometry requires instances.gt_boxes")
+    boxes = instances.gt_boxes.tensor
+    if boxes.dim() != 2 or boxes.shape[1] != 4:
+        raise ValueError(f"pair geometry expects gt_boxes tensor [N,4], got {tuple(boxes.shape)}")
+    image_height, image_width = float(instances.image_size[0]), float(instances.image_size[1])
+    if image_height <= 0.0 or image_width <= 0.0:
+        raise ValueError(f"invalid instances image_size for pair geometry: {instances.image_size}")
+
+    boxes = boxes.to(dtype=torch.float32)
+    num_nodes = int(boxes.shape[0])
+    if num_nodes == 0:
+        return boxes.new_zeros((0, 0, len(names)))
+
+    eps = torch.finfo(boxes.dtype).eps
+    x1, y1, x2, y2 = boxes.unbind(dim=1)
+    widths = (x2 - x1).clamp(min=eps)
+    heights = (y2 - y1).clamp(min=eps)
+    areas = widths * heights
+    cx = x1 + 0.5 * widths
+    cy = y1 + 0.5 * heights
+
+    source_x1, target_x1 = x1[:, None], x1[None, :]
+    source_y1, target_y1 = y1[:, None], y1[None, :]
+    source_x2, target_x2 = x2[:, None], x2[None, :]
+    source_y2, target_y2 = y2[:, None], y2[None, :]
+    source_widths, target_widths = widths[:, None], widths[None, :]
+    source_heights, target_heights = heights[:, None], heights[None, :]
+    source_areas, target_areas = areas[:, None], areas[None, :]
+    source_cx, target_cx = cx[:, None], cx[None, :]
+    source_cy, target_cy = cy[:, None], cy[None, :]
+
+    x_overlap = (torch.minimum(source_x2, target_x2) - torch.maximum(source_x1, target_x1)).clamp(min=0.0)
+    x_overlap_min = x_overlap / torch.minimum(source_widths, target_widths).clamp(min=eps)
+    x_span = (torch.maximum(source_x2, target_x2) - torch.minimum(source_x1, target_x1)).clamp(min=eps)
+    x_overlap_union = x_overlap / x_span
+
+    y_overlap = (torch.minimum(source_y2, target_y2) - torch.maximum(source_y1, target_y1)).clamp(min=0.0)
+    y_overlap_min = y_overlap / torch.minimum(source_heights, target_heights).clamp(min=eps)
+    y_gap_norm = (
+        torch.maximum(source_y1, target_y1) - torch.minimum(source_y2, target_y2)
+    ).clamp(min=0.0) / max(image_height, 1.0)
+
+    area_ratio = torch.minimum(source_areas, target_areas) / torch.maximum(source_areas, target_areas).clamp(min=eps)
+    source_in_front = (source_cy < target_cy).to(dtype=boxes.dtype)
+    signed_dy = (source_cy - target_cy) / max(image_height, 1.0)
+    signed_dx = (source_cx - target_cx) / max(image_width, 1.0)
+    front_x_overlap_union = source_in_front * x_overlap_union
+
+    feature_values = {
+        "source_in_front": source_in_front,
+        "signed_dy": signed_dy,
+        "signed_dx": signed_dx,
+        "x_overlap_min": x_overlap_min,
+        "x_overlap_union": x_overlap_union,
+        "y_overlap_min": y_overlap_min,
+        "y_gap_norm": y_gap_norm,
+        "area_ratio_min_over_max": area_ratio,
+        "area_ratio": area_ratio,
+        "front_x_overlap_union": front_x_overlap_union,
+        "front_x_overlap": front_x_overlap_union,
+    }
+    return torch.stack([feature_values[name] for name in names], dim=-1)
+
+
 @META_ARCH_REGISTRY.register()
 class MemGraphDenseKnownNodes(nn.Module):
     """Known-node MEM dense graph predictor for Option 2A."""
@@ -265,6 +372,12 @@ class MemGraphDenseKnownNodes(nn.Module):
         self.mask_graph_diagonal = bool(mem_cfg.MASK_GRAPH_DIAGONAL)
         self.graph_loss_pos_weight = float(mem_cfg.GRAPH_LOSS_POS_WEIGHT)
         self.require_known_nodes = bool(mem_cfg.REQUIRE_KNOWN_NODES)
+        self.pair_geometry_enabled = bool(mem_cfg.PAIR_GEOMETRY_ENABLED)
+        self.pair_geometry_feature_names: Tuple[str, ...] = (
+            _normalise_pair_geometry_feature_names(mem_cfg.PAIR_GEOMETRY_FEATURES)
+            if self.pair_geometry_enabled
+            else tuple()
+        )
         self.normalizer = MemInputNormalizer(
             mode=mem_cfg.INPUT_NORMALIZATION,
             semantic_max_value=float(mem_cfg.SEMANTIC_MAX_VALUE),
@@ -287,6 +400,7 @@ class MemGraphDenseKnownNodes(nn.Module):
             hidden_dim=int(graph_cfg.HIDDEN_DIM),
             num_heads=int(graph_cfg.NUM_HEADS),
             edge_features=graph_cfg.EDGE_FEATURES,
+            extra_edge_feature_dim=len(self.pair_geometry_feature_names),
         )
         self.to(self.device)
 
@@ -308,7 +422,14 @@ class MemGraphDenseKnownNodes(nn.Module):
         if num_nodes == 0:
             raise ValueError("MemGraphDenseKnownNodes requires at least one known node in v0")
 
-        graph_logits = self._predict_graph_logits(node_tokens)
+        pair_geometry_features = None
+        if self.pair_geometry_enabled:
+            pair_geometry_features = build_mem_pair_geometry_features(
+                instances,
+                self.pair_geometry_feature_names,
+            ).to(device=self.device, dtype=node_tokens.dtype)
+
+        graph_logits = self._predict_graph_logits(node_tokens, pair_geometry_features=pair_geometry_features)
         if self.training:
             target = item.get("graph_gt", item.get("dense_gt"))
             if target is None:
@@ -333,10 +454,16 @@ class MemGraphDenseKnownNodes(nn.Module):
                 "graph_logits": graph_logits,
                 "graph_probs": graph_probs,
                 "node_order_instance_ids": metadata.get("node_order_instance_ids", []),
+                "pair_geometry_feature_names": list(self.pair_geometry_feature_names),
             }
         ]
 
-    def _predict_graph_logits(self, node_tokens: torch.Tensor) -> torch.Tensor:
+    def _predict_graph_logits(
+        self,
+        node_tokens: torch.Tensor,
+        *,
+        pair_geometry_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         hs = node_tokens.unsqueeze(0).unsqueeze(0)  # [L=1, B=1, Q, C]
-        graph_logits = self.graph_head(hs)[-1, 0, :, :, 0]
+        graph_logits = self.graph_head(hs, edge_extra_features=pair_geometry_features)[-1, 0, :, :, 0]
         return graph_logits

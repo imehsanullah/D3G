@@ -35,7 +35,16 @@ class DummyHead(nn.Module):
 class BaseGHead(nn.Module):
     
     @configurable
-    def __init__(self, num_layers=1, in_dim=256, hidden_dim=256, num_heads=1, num_nodes=100, edge_features='constant_one') -> None:
+    def __init__(
+        self,
+        num_layers=1,
+        in_dim=256,
+        hidden_dim=256,
+        num_heads=1,
+        num_nodes=100,
+        edge_features='constant_one',
+        extra_edge_feature_dim=0,
+    ) -> None:
         super().__init__()
         self.in_dim = in_dim
         self.hidden_dim = hidden_dim
@@ -43,6 +52,9 @@ class BaseGHead(nn.Module):
         self.num_nodes = num_nodes
         self.num_layers = num_layers
         self.edge_features = edge_features
+        self.extra_edge_feature_dim = int(extra_edge_feature_dim)
+        if self.extra_edge_feature_dim < 0:
+            raise ValueError("extra_edge_feature_dim must be non-negative")
         
         if edge_features == 'concat':
             out_proj_edge = hidden_dim // 2
@@ -57,14 +69,55 @@ class BaseGHead(nn.Module):
         self.proj_node_input = nn.Linear(in_dim, hidden_dim)
         self.edge_features = edge_features
         self.hidden_dim = hidden_dim
+        if self.extra_edge_feature_dim > 0:
+            self.extra_edge_proj = nn.Sequential(
+                nn.Linear(self.extra_edge_feature_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.extra_edge_proj = None
     
     @classmethod
     def from_config(cls, cfg):
         cfg = cfg.MODEL.GRAPH_HEAD
-        return {'num_layers': cfg.NUM_LAYERS, 'hidden_dim': cfg.HIDDEN_DIM, 'num_heads': cfg.NUM_HEADS, 'edge_features': cfg.EDGE_FEATURES} 
+        return {
+            'num_layers': cfg.NUM_LAYERS,
+            'hidden_dim': cfg.HIDDEN_DIM,
+            'num_heads': cfg.NUM_HEADS,
+            'edge_features': cfg.EDGE_FEATURES,
+            'extra_edge_feature_dim': getattr(cfg, 'EXTRA_EDGE_FEATURE_DIM', 0),
+        }
     
     
-    def _compute_edge_features(self, features):
+    def _prepare_extra_edge_features(self, edge_extra_features, *, layers, batch_size, num_nodes, device, dtype):
+        if self.extra_edge_feature_dim == 0:
+            if edge_extra_features is not None:
+                raise ValueError("edge_extra_features were provided but extra_edge_feature_dim is 0")
+            return None
+        if edge_extra_features is None:
+            raise ValueError("edge_extra_features are required when extra_edge_feature_dim is positive")
+        extra = edge_extra_features.to(device=device, dtype=dtype)
+        if extra.shape[-1] != self.extra_edge_feature_dim:
+            raise ValueError(
+                f"edge_extra_features last dim must be {self.extra_edge_feature_dim}, got {extra.shape[-1]}"
+            )
+        if extra.dim() == 3:
+            if extra.shape[:2] != (num_nodes, num_nodes):
+                raise ValueError(f"edge_extra_features must have shape [Q,Q,F], got {tuple(extra.shape)}")
+            extra = extra.unsqueeze(0).unsqueeze(0).expand(layers, batch_size, -1, -1, -1)
+        elif extra.dim() == 4:
+            if extra.shape[0] != batch_size or extra.shape[1:3] != (num_nodes, num_nodes):
+                raise ValueError(f"edge_extra_features must have shape [B,Q,Q,F], got {tuple(extra.shape)}")
+            extra = extra.unsqueeze(0).expand(layers, -1, -1, -1, -1)
+        elif extra.dim() == 5:
+            if extra.shape[:4] != (layers, batch_size, num_nodes, num_nodes):
+                raise ValueError(f"edge_extra_features must have shape [L,B,Q,Q,F], got {tuple(extra.shape)}")
+        else:
+            raise ValueError(f"edge_extra_features must have 3, 4, or 5 dims, got {tuple(extra.shape)}")
+        return extra
+
+    def _compute_edge_features(self, features, edge_extra_features=None):
         # features L B Q C 
         L, B, Q, C = features.shape
         device = features.device
@@ -82,6 +135,16 @@ class BaseGHead(nn.Module):
             e = e1[:, :, None, :, :] * e2[:, :, :, None, :]
         else:
             raise NotImplementedError(f'{self.edge_features} aggregations not implemented')
+        extra = self._prepare_extra_edge_features(
+            edge_extra_features,
+            layers=L,
+            batch_size=B,
+            num_nodes=Q,
+            device=device,
+            dtype=features.dtype,
+        )
+        if extra is not None:
+            e = e + self.extra_edge_proj(extra)
         return e
     
 
@@ -99,17 +162,22 @@ class DenseGraphTransformerHead(BaseGHead):
     @classmethod
     def from_config(cls, cfg):
         cfg = cfg.MODEL.GRAPH_HEAD
-        return {'num_layers': cfg.NUM_LAYERS, 'hidden_dim': cfg.HIDDEN_DIM, 'num_heads': cfg.NUM_HEADS, 'edge_features': cfg.EDGE_FEATURES} 
+        return {
+            'num_layers': cfg.NUM_LAYERS,
+            'hidden_dim': cfg.HIDDEN_DIM,
+            'num_heads': cfg.NUM_HEADS,
+            'edge_features': cfg.EDGE_FEATURES,
+            'extra_edge_feature_dim': getattr(cfg, 'EXTRA_EDGE_FEATURE_DIM', 0),
+        }
     
-    
-    def forward(self, hs: torch.Tensor):
+    def forward(self, hs: torch.Tensor, edge_extra_features=None):
         """ _summary_
         Args:
             hs (torch.Tensor): L x B x Q x C
         """
         L, B, Q, C = hs.shape 
         
-        e = self._compute_edge_features(features=hs)
+        e = self._compute_edge_features(features=hs, edge_extra_features=edge_extra_features)
         hs = self.proj_node_input(hs)
         # hs = es.rearrange(hs, 'B L Q C -> (B L) Q C')
         
@@ -132,5 +200,4 @@ def build_graph_head(cfg):
         'GraphTransformerDense': DenseGraphTransformerHead,
     }[name](cfg)
     return head
-    
     

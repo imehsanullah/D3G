@@ -43,7 +43,7 @@ DEFAULT_LOSS_MODE = "bce"
 LOSS_MODES = ("bce", "train_pos_weighted_bce")
 DEFAULT_DIAGNOSTIC_THRESHOLDS = (0.03, 0.05, 0.07, 0.09, 0.10, 0.12, 0.15, 0.20, 0.30, 0.50)
 DEFAULT_HISTOGRAM_BIN_EDGES = (0.0, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20, 0.30, 0.50, 1.0)
-DEFAULT_CONFIG_FILE = REPO_ROOT / "configs" / "mem" / "option2a_known_nodes_graph_smoke.yaml"
+DEFAULT_CONFIG_FILE = REPO_ROOT / "configs" / "mem" / "option2a_gt_known_nodes.yaml"
 SCHEMA = "mem_d3g_known_node_tiny_train_debug_summary_v0"
 
 
@@ -555,10 +555,16 @@ def build_mem_graph_dense_known_nodes_tiny_train_summary(
     mapper = MemObservedGtMapper(
         data_root=data_root,
         is_train=True,
-        graph_gt_type="dense",
+        graph_gt_type=cfg.INPUT.GRAPH_GT_TYPE,
+        observed_view_protocol=cfg.INPUT.MEM_OBSERVED_VIEW_PROTOCOL,
         expected_height=expected_height,
         expected_width=expected_width,
+        max_selected_views=int(cfg.INPUT.MEM_MAX_SELECTED_VIEWS),
+        semantic_class_min=int(cfg.INPUT.MEM_SEMANTIC_CLASS_MIN),
+        semantic_class_max=int(cfg.INPUT.MEM_SEMANTIC_CLASS_MAX),
         validate_semantic_range=validate_semantic_range,
+        mem_node_source=cfg.INPUT.MEM_NODE_SOURCE,
+        mem_graph_target_scope=cfg.INPUT.MEM_GRAPH_TARGET_SCOPE,
     )
     train_mapped = [mapper(record) for record in train_records]
     val_mapped = [mapper(record) for record in val_records]
@@ -642,6 +648,8 @@ def build_mem_graph_dense_known_nodes_tiny_train_summary(
         "records_json": str(records_json),
         "data_root": str(data_root),
         "config_file": str(_as_path(config_file)) if config_file is not None else None,
+        "mem_node_source": str(cfg.INPUT.MEM_NODE_SOURCE),
+        "mem_graph_target_scope": str(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE),
         "device": str(device),
         "seed": int(seed),
         "optimizer": "AdamW",

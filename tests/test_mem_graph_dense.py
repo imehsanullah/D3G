@@ -9,13 +9,14 @@ from models.mem_graph_dense import (
     MemGraphDenseKnownNodes,
     MemKnownNodeTokenExtractor,
     MemMapEncoder,
+    build_mem_pair_geometry_features,
     masked_dense_graph_bce_loss,
 )
 from utils.configs import add_dep_graph_config, add_detr_config
 
 
 class MemGraphDenseTest(unittest.TestCase):
-    def _cfg(self, *, height=32, width=40, hidden_dim=16):
+    def _cfg(self, *, height=32, width=40, hidden_dim=16, pair_geometry=False):
         cfg = get_cfg()
         add_dep_graph_config(cfg)
         add_detr_config(cfg)
@@ -32,6 +33,7 @@ class MemGraphDenseTest(unittest.TestCase):
         cfg.MODEL.MEM_GRAPH.INPUT_NORMALIZATION = "scaled_v0"
         cfg.MODEL.MEM_GRAPH.POOLER_RESOLUTION = 2
         cfg.MODEL.MEM_GRAPH.MASK_GRAPH_DIAGONAL = True
+        cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED = pair_geometry
         cfg.INPUT.MEM_EXPECTED_HEIGHT = height
         cfg.INPUT.MEM_EXPECTED_WIDTH = width
         return cfg
@@ -116,6 +118,48 @@ class MemGraphDenseTest(unittest.TestCase):
         self.assertTrue(torch.allclose(tokens[0], first_token_again))
         self.assertFalse(torch.allclose(tokens[0], tokens[1]))
 
+    def test_mem_pair_geometry_features_are_directed_and_normalized(self):
+        instances = Instances((100, 100))
+        instances.gt_boxes = Boxes(
+            torch.tensor(
+                [
+                    [10.0, 10.0, 30.0, 30.0],
+                    [10.0, 40.0, 30.0, 60.0],
+                    [50.0, 10.0, 70.0, 30.0],
+                ],
+                dtype=torch.float32,
+            )
+        )
+        feature_names = [
+            "source_in_front",
+            "signed_dy",
+            "signed_dx",
+            "x_overlap_min",
+            "x_overlap_union",
+            "y_overlap_min",
+            "y_gap_norm",
+            "area_ratio_min_over_max",
+            "front_x_overlap_union",
+        ]
+
+        features = build_mem_pair_geometry_features(instances, feature_names)
+        index = {name: idx for idx, name in enumerate(feature_names)}
+
+        self.assertEqual(features.shape, torch.Size([3, 3, len(feature_names)]))
+        self.assertAlmostEqual(float(features[0, 1, index["source_in_front"]]), 1.0)
+        self.assertAlmostEqual(float(features[1, 0, index["source_in_front"]]), 0.0)
+        self.assertAlmostEqual(float(features[0, 1, index["signed_dy"]]), -0.3, places=6)
+        self.assertAlmostEqual(float(features[1, 0, index["signed_dy"]]), 0.3, places=6)
+        self.assertAlmostEqual(float(features[0, 1, index["signed_dx"]]), 0.0, places=6)
+        self.assertAlmostEqual(float(features[0, 2, index["signed_dx"]]), -0.4, places=6)
+        self.assertAlmostEqual(float(features[0, 1, index["x_overlap_min"]]), 1.0, places=6)
+        self.assertAlmostEqual(float(features[0, 1, index["x_overlap_union"]]), 1.0, places=6)
+        self.assertAlmostEqual(float(features[0, 1, index["y_overlap_min"]]), 0.0, places=6)
+        self.assertAlmostEqual(float(features[0, 1, index["y_gap_norm"]]), 0.1, places=6)
+        self.assertAlmostEqual(float(features[0, 1, index["area_ratio_min_over_max"]]), 1.0, places=6)
+        self.assertAlmostEqual(float(features[0, 1, index["front_x_overlap_union"]]), 1.0, places=6)
+        self.assertAlmostEqual(float(features[1, 0, index["front_x_overlap_union"]]), 0.0, places=6)
+
     def test_mem_graph_dense_known_nodes_returns_synthetic_training_loss(self):
         torch.manual_seed(0)
         cfg = self._cfg(hidden_dim=16)
@@ -165,6 +209,28 @@ class MemGraphDenseTest(unittest.TestCase):
         self.assertEqual(outputs[0]["graph_probs"].shape, torch.Size([3, 3]))
         self.assertTrue(torch.isfinite(outputs[0]["graph_logits"]).all())
 
+    def test_mem_graph_dense_known_nodes_pair_geometry_enabled_returns_logits(self):
+        torch.manual_seed(0)
+        cfg = self._cfg(hidden_dim=16, pair_geometry=True)
+        model = MemGraphDenseKnownNodes(cfg)
+        model.eval()
+        item = {
+            "image": torch.randn(30, 32, 40),
+            "height": 32,
+            "width": 40,
+            "image_id": "synthetic/000000002",
+            "instances": self._instances(height=32, width=40),
+            "graph_gt": torch.zeros(3, 3, dtype=torch.long),
+        }
+
+        with torch.no_grad():
+            outputs = model([item])
+
+        self.assertEqual(model.graph_head.extra_edge_feature_dim, len(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES))
+        self.assertEqual(outputs[0]["graph_logits"].shape, torch.Size([3, 3]))
+        self.assertEqual(outputs[0]["pair_geometry_feature_names"], list(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES))
+        self.assertTrue(torch.isfinite(outputs[0]["graph_logits"]).all())
+
     def test_mem_graph_config_defaults_and_smoke_yaml_parse(self):
         cfg = get_cfg()
         add_dep_graph_config(cfg)
@@ -178,8 +244,20 @@ class MemGraphDenseTest(unittest.TestCase):
         self.assertTrue(cfg.MODEL.MEM_GRAPH.REQUIRE_KNOWN_NODES)
         self.assertEqual(cfg.MODEL.GRAPH_HEAD.NAME, "GraphTransformerDense")
         self.assertEqual(cfg.MODEL.GRAPH_HEAD.EDGE_FEATURES, "concat")
+        self.assertFalse(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
         self.assertEqual(cfg.SOLVER.IMS_PER_BATCH, 1)
         self.assertEqual(cfg.DATALOADER.NUM_WORKERS, 0)
+
+    def test_option2b_pair_geometry_config_enables_feature_path(self):
+        cfg = get_cfg()
+        add_dep_graph_config(cfg)
+        add_detr_config(cfg)
+        cfg.merge_from_file("configs/mem/option2b_observed_visible_nodes_pair_geometry.yaml")
+
+        self.assertEqual(cfg.INPUT.MEM_NODE_SOURCE, "observed_instance_maps")
+        self.assertEqual(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
+        self.assertTrue(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
+        self.assertIn("front_x_overlap_union", list(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES))
 
     def test_meta_architecture_is_registered(self):
         self.assertIs(META_ARCH_REGISTRY.get("MemGraphDenseKnownNodes"), MemGraphDenseKnownNodes)

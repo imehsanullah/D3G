@@ -22,8 +22,11 @@ def add_dep_graph_config(cfg):
     cfg.INPUT.MEM_SEMANTIC_CLASS_MIN = 0
     cfg.INPUT.MEM_SEMANTIC_CLASS_MAX = 14
     cfg.INPUT.MEM_VALIDATE_SEMANTIC_RANGE = True
+    cfg.INPUT.MEM_NODE_SOURCE = 'gt'
+    cfg.INPUT.MEM_GRAPH_TARGET_SCOPE = 'gt_all'
     cfg.DATASETS.ROOT = './datasets'
     cfg.DATASETS.MEM_RECORDS_JSON = ''
+    cfg.DATASETS.MEM_SPLIT_JSON = ''
     cfg.DATASETS.MEM_MAX_RECORDS = 0
     
     cfg.SOLVER.OPTIMIZER = "ADAM"
@@ -82,8 +85,21 @@ def add_detr_config(cfg):
     cfg.MODEL.MEM_GRAPH.SEMANTIC_MAX_VALUE = 14.0
     cfg.MODEL.MEM_GRAPH.POOLER_RESOLUTION = 3
     cfg.MODEL.MEM_GRAPH.GRAPH_LOSS_POS_WEIGHT = 0.0
+    cfg.MODEL.MEM_GRAPH.LOSS_MODE = 'train_pos_weighted_bce'
     cfg.MODEL.MEM_GRAPH.MASK_GRAPH_DIAGONAL = True
     cfg.MODEL.MEM_GRAPH.REQUIRE_KNOWN_NODES = True
+    cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED = False
+    cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES = [
+        'source_in_front',
+        'signed_dy',
+        'signed_dx',
+        'x_overlap_min',
+        'x_overlap_union',
+        'y_overlap_min',
+        'y_gap_norm',
+        'area_ratio_min_over_max',
+        'front_x_overlap_union',
+    ]
 
     cfg.MODEL.DETR.GRAPH_CRITEREON = 'cross'
     cfg.MODEL.DETR.GRAPH_WEIGHT = 1.0

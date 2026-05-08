@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Forward-only MEM known-node dense graph smoke for D3G.
 
-This command loads a tiny explicit MEM Option 2A records JSON/JSONL file,
+This command loads a tiny explicit MEM Option 2A/2B records JSON/JSONL file,
 materializes mapper outputs, and runs the `MemGraphDenseKnownNodes` model in
 CPU eval mode under `torch.no_grad()`.
 
@@ -32,7 +32,7 @@ from utils.configs import add_dep_graph_config, add_detr_config
 
 
 MAX_RECORDS = 5
-DEFAULT_CONFIG_FILE = REPO_ROOT / "configs" / "mem" / "option2a_known_nodes_graph_smoke.yaml"
+DEFAULT_CONFIG_FILE = REPO_ROOT / "configs" / "mem" / "option2a_gt_known_nodes.yaml"
 
 
 def _shape(tensor: Any) -> List[int]:
@@ -106,6 +106,12 @@ def _summarize_forward_output(mapped: Dict[str, Any], model_output: Dict[str, An
         "graph_probs_max": _tensor_max(graph_probs),
         "selected_view_indices": metadata.get("selected_view_indices"),
         "node_order_instance_ids": metadata.get("node_order_instance_ids"),
+        "mem_node_source": metadata.get("mem_node_source"),
+        "mem_graph_target_scope": metadata.get("mem_graph_target_scope"),
+        "observed_visible_instance_ids": metadata.get("observed_visible_instance_ids"),
+        "gt_aligned_instance_ids": metadata.get("gt_aligned_instance_ids"),
+        "unmatched_observed_instance_ids": metadata.get("unmatched_observed_instance_ids"),
+        "hidden_gt_instance_ids": metadata.get("hidden_gt_instance_ids"),
         "edge_type": metadata.get("edge_type"),
         "graph_gt_convention": metadata.get("graph_gt_convention"),
         "direct_mem_dense_graph_gt": bool(metadata.get("direct_mem_dense_graph_gt", False)),
@@ -137,10 +143,16 @@ def build_mem_graph_dense_known_nodes_forward_smoke_summary(
     mapper = MemObservedGtMapper(
         data_root=data_root,
         is_train=False,
-        graph_gt_type="dense",
+        graph_gt_type=cfg.INPUT.GRAPH_GT_TYPE,
+        observed_view_protocol=cfg.INPUT.MEM_OBSERVED_VIEW_PROTOCOL,
         expected_height=expected_height,
         expected_width=expected_width,
+        max_selected_views=int(cfg.INPUT.MEM_MAX_SELECTED_VIEWS),
+        semantic_class_min=int(cfg.INPUT.MEM_SEMANTIC_CLASS_MIN),
+        semantic_class_max=int(cfg.INPUT.MEM_SEMANTIC_CLASS_MAX),
         validate_semantic_range=validate_semantic_range,
+        mem_node_source=cfg.INPUT.MEM_NODE_SOURCE,
+        mem_graph_target_scope=cfg.INPUT.MEM_GRAPH_TARGET_SCOPE,
     )
     model = MemGraphDenseKnownNodes(cfg)
     model.eval()
@@ -167,6 +179,8 @@ def build_mem_graph_dense_known_nodes_forward_smoke_summary(
         "records_json": str(records_json),
         "data_root": str(data_root),
         "config_file": str(config_file) if config_file is not None else None,
+        "mem_node_source": str(cfg.INPUT.MEM_NODE_SOURCE),
+        "mem_graph_target_scope": str(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE),
         "device": device,
         "model_architecture": "MemGraphDenseKnownNodes",
         "model_mode": "eval",

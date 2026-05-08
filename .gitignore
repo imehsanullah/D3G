@@ -168,5 +168,10 @@ output/*
 datasets
 visualization_attempts
 .claude
+
+# Generated training artifacts
+checkpoints/*
+outputs/*
+
 checkpoints/detr-r50-dc5.pth
 checkpoints/r50_deformable_detr-checkpoint.pth
