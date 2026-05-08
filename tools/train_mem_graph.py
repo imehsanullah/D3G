@@ -1453,6 +1453,7 @@ def run_mem_graph_training(
         "data_root": data_root_value,
         "mem_node_source": str(cfg.INPUT.MEM_NODE_SOURCE),
         "mem_graph_target_scope": str(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE),
+        "mem_zero_map_node_features": bool(cfg.MODEL.MEM_GRAPH.ZERO_MAP_NODE_FEATURES),
         "mem_pair_geometry_enabled": bool(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED),
         "mem_pair_geometry_features": list(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES),
         "model_meta_architecture": str(cfg.MODEL.META_ARCHITECTURE),

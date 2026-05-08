@@ -200,15 +200,37 @@ class MemKnownNodeTokenExtractor(nn.Module):
         )
 
     def forward(self, features: torch.Tensor, instances_list: Sequence[Instances]) -> List[torch.Tensor]:
+        return self.forward_with_options(features, instances_list, zero_map_node_features=False)
+
+    def forward_with_options(
+        self,
+        features: torch.Tensor,
+        instances_list: Sequence[Instances],
+        *,
+        zero_map_node_features: bool = False,
+    ) -> List[torch.Tensor]:
         if features.dim() != 4:
             raise ValueError(f"features must have shape [B,C,Hf,Wf], got {tuple(features.shape)}")
         if features.shape[0] != len(instances_list):
             raise ValueError(
                 f"feature batch size {features.shape[0]} does not match {len(instances_list)} instances objects"
             )
-        return [self._tokens_for_one_image(features[index], instances) for index, instances in enumerate(instances_list)]
+        return [
+            self._tokens_for_one_image(
+                features[index],
+                instances,
+                zero_map_node_features=zero_map_node_features,
+            )
+            for index, instances in enumerate(instances_list)
+        ]
 
-    def _tokens_for_one_image(self, feature: torch.Tensor, instances: Instances) -> torch.Tensor:
+    def _tokens_for_one_image(
+        self,
+        feature: torch.Tensor,
+        instances: Instances,
+        *,
+        zero_map_node_features: bool = False,
+    ) -> torch.Tensor:
         if not instances.has("gt_boxes") or not instances.has("gt_classes"):
             raise ValueError("known-node MEM graph model requires instances.gt_boxes and instances.gt_classes")
         boxes = instances.gt_boxes.tensor.to(device=feature.device, dtype=feature.dtype)
@@ -222,10 +244,13 @@ class MemKnownNodeTokenExtractor(nn.Module):
                 f"MEM gt_classes must be in [0, {self.num_object_classes - 1}], got {classes.detach().cpu().tolist()}"
             )
 
-        pooled = torch.stack([self._pool_box(feature, box, instances.image_size) for box in boxes], dim=0)
-        pooled_tokens = self.pool_proj(pooled.flatten(1))
         class_tokens = self.class_embedding(classes)
         geometry_tokens = self.box_geometry_mlp(self._normalized_box_geometry(boxes, instances.image_size))
+        if zero_map_node_features:
+            pooled_tokens = torch.zeros_like(class_tokens)
+        else:
+            pooled = torch.stack([self._pool_box(feature, box, instances.image_size) for box in boxes], dim=0)
+            pooled_tokens = self.pool_proj(pooled.flatten(1))
         return pooled_tokens + class_tokens + geometry_tokens
 
     def _pool_box(
@@ -372,6 +397,7 @@ class MemGraphDenseKnownNodes(nn.Module):
         self.mask_graph_diagonal = bool(mem_cfg.MASK_GRAPH_DIAGONAL)
         self.graph_loss_pos_weight = float(mem_cfg.GRAPH_LOSS_POS_WEIGHT)
         self.require_known_nodes = bool(mem_cfg.REQUIRE_KNOWN_NODES)
+        self.zero_map_node_features = bool(mem_cfg.ZERO_MAP_NODE_FEATURES)
         self.pair_geometry_enabled = bool(mem_cfg.PAIR_GEOMETRY_ENABLED)
         self.pair_geometry_feature_names: Tuple[str, ...] = (
             _normalise_pair_geometry_feature_names(mem_cfg.PAIR_GEOMETRY_FEATURES)
@@ -416,8 +442,15 @@ class MemGraphDenseKnownNodes(nn.Module):
         if self.require_known_nodes and (not instances.has("gt_boxes") or not instances.has("gt_classes")):
             raise ValueError("MemGraphDenseKnownNodes requires mapper-provided known GT boxes/classes")
 
-        features = self.encoder(self.normalizer(image.unsqueeze(0)))
-        node_tokens = self.node_token_extractor(features, [instances])[0]
+        if self.zero_map_node_features:
+            features = image.new_zeros((1, int(self.encoder.out_channels), 1, 1))
+        else:
+            features = self.encoder(self.normalizer(image.unsqueeze(0)))
+        node_tokens = self.node_token_extractor.forward_with_options(
+            features,
+            [instances],
+            zero_map_node_features=self.zero_map_node_features,
+        )[0]
         num_nodes = int(node_tokens.shape[0])
         if num_nodes == 0:
             raise ValueError("MemGraphDenseKnownNodes requires at least one known node in v0")
@@ -455,6 +488,7 @@ class MemGraphDenseKnownNodes(nn.Module):
                 "graph_probs": graph_probs,
                 "node_order_instance_ids": metadata.get("node_order_instance_ids", []),
                 "pair_geometry_feature_names": list(self.pair_geometry_feature_names),
+                "zero_map_node_features": self.zero_map_node_features,
             }
         ]
 

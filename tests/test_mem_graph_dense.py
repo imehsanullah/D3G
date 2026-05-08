@@ -16,7 +16,7 @@ from utils.configs import add_dep_graph_config, add_detr_config
 
 
 class MemGraphDenseTest(unittest.TestCase):
-    def _cfg(self, *, height=32, width=40, hidden_dim=16, pair_geometry=False):
+    def _cfg(self, *, height=32, width=40, hidden_dim=16, pair_geometry=False, zero_map_node_features=False):
         cfg = get_cfg()
         add_dep_graph_config(cfg)
         add_detr_config(cfg)
@@ -34,6 +34,7 @@ class MemGraphDenseTest(unittest.TestCase):
         cfg.MODEL.MEM_GRAPH.POOLER_RESOLUTION = 2
         cfg.MODEL.MEM_GRAPH.MASK_GRAPH_DIAGONAL = True
         cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED = pair_geometry
+        cfg.MODEL.MEM_GRAPH.ZERO_MAP_NODE_FEATURES = zero_map_node_features
         cfg.INPUT.MEM_EXPECTED_HEIGHT = height
         cfg.INPUT.MEM_EXPECTED_WIDTH = width
         return cfg
@@ -231,6 +232,28 @@ class MemGraphDenseTest(unittest.TestCase):
         self.assertEqual(outputs[0]["pair_geometry_feature_names"], list(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES))
         self.assertTrue(torch.isfinite(outputs[0]["graph_logits"]).all())
 
+    def test_zero_map_node_features_makes_logits_independent_of_mem_map_values(self):
+        torch.manual_seed(0)
+        cfg = self._cfg(hidden_dim=16, pair_geometry=True, zero_map_node_features=True)
+        model = MemGraphDenseKnownNodes(cfg)
+        model.eval()
+        base_item = {
+            "height": 32,
+            "width": 40,
+            "image_id": "synthetic/zero_map",
+            "instances": self._instances(height=32, width=40),
+            "graph_gt": torch.zeros(3, 3, dtype=torch.long),
+        }
+        item_a = dict(base_item, image=torch.randn(30, 32, 40))
+        item_b = dict(base_item, image=torch.randn(30, 32, 40) * 100.0 + 50.0)
+
+        with torch.no_grad():
+            logits_a = model([item_a])[0]["graph_logits"]
+            logits_b = model([item_b])[0]["graph_logits"]
+
+        self.assertTrue(model.zero_map_node_features)
+        self.assertTrue(torch.allclose(logits_a, logits_b, atol=0.0, rtol=0.0))
+
     def test_mem_graph_config_defaults_and_smoke_yaml_parse(self):
         cfg = get_cfg()
         add_dep_graph_config(cfg)
@@ -244,6 +267,7 @@ class MemGraphDenseTest(unittest.TestCase):
         self.assertTrue(cfg.MODEL.MEM_GRAPH.REQUIRE_KNOWN_NODES)
         self.assertEqual(cfg.MODEL.GRAPH_HEAD.NAME, "GraphTransformerDense")
         self.assertEqual(cfg.MODEL.GRAPH_HEAD.EDGE_FEATURES, "concat")
+        self.assertFalse(cfg.MODEL.MEM_GRAPH.ZERO_MAP_NODE_FEATURES)
         self.assertFalse(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
         self.assertEqual(cfg.SOLVER.IMS_PER_BATCH, 1)
         self.assertEqual(cfg.DATALOADER.NUM_WORKERS, 0)
@@ -256,8 +280,20 @@ class MemGraphDenseTest(unittest.TestCase):
 
         self.assertEqual(cfg.INPUT.MEM_NODE_SOURCE, "observed_instance_maps")
         self.assertEqual(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
+        self.assertFalse(cfg.MODEL.MEM_GRAPH.ZERO_MAP_NODE_FEATURES)
         self.assertTrue(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
         self.assertIn("front_x_overlap_union", list(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES))
+
+    def test_option2b_pair_geometry_zero_map_config_keeps_geometry_but_zeros_map_node_features(self):
+        cfg = get_cfg()
+        add_dep_graph_config(cfg)
+        add_detr_config(cfg)
+        cfg.merge_from_file("configs/mem/option2b_observed_visible_nodes_pair_geometry_zero_map.yaml")
+
+        self.assertEqual(cfg.INPUT.MEM_NODE_SOURCE, "observed_instance_maps")
+        self.assertEqual(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
+        self.assertTrue(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
+        self.assertTrue(cfg.MODEL.MEM_GRAPH.ZERO_MAP_NODE_FEATURES)
 
     def test_meta_architecture_is_registered(self):
         self.assertIs(META_ARCH_REGISTRY.get("MemGraphDenseKnownNodes"), MemGraphDenseKnownNodes)

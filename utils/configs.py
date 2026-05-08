@@ -88,6 +88,7 @@ def add_detr_config(cfg):
     cfg.MODEL.MEM_GRAPH.LOSS_MODE = 'train_pos_weighted_bce'
     cfg.MODEL.MEM_GRAPH.MASK_GRAPH_DIAGONAL = True
     cfg.MODEL.MEM_GRAPH.REQUIRE_KNOWN_NODES = True
+    cfg.MODEL.MEM_GRAPH.ZERO_MAP_NODE_FEATURES = False
     cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED = False
     cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES = [
         'source_in_front',
