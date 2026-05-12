@@ -37,7 +37,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from data.mem_observed_gt_dataset import load_mem_observed_gt_records
 from data.mem_observed_gt_mapper import MemObservedGtMapper
-from models.mem_graph_dense import MemGraphDenseKnownNodes
+from models.mem_graph_dense import MemGraphDenseKnownNodes, node_binary_bce_loss
 from utils.configs import add_dep_graph_config, add_detr_config
 
 
@@ -360,18 +360,49 @@ def _normalise_score_histogram_bin_edges(bin_edges: Optional[Sequence[float]]) -
 
 
 def compute_average_precision(scores: Sequence[float], labels: Sequence[int]) -> Optional[float]:
-    pairs = [(float(score), int(label)) for score, label in zip(scores, labels)]
-    num_positive = sum(label for _, label in pairs)
+    score_list = [float(score) for score in scores]
+    label_list = [int(label) for label in labels]
+    if len(score_list) != len(label_list):
+        raise ValueError("scores and labels must have matching lengths")
+    if any(label not in (0, 1) for label in label_list):
+        raise ValueError("labels must be binary 0/1")
+    num_positive = sum(label_list)
     if num_positive == 0:
         return None
-    pairs.sort(key=lambda item: item[0], reverse=True)
+    sorted_indices = sorted(
+        range(len(score_list)),
+        key=lambda index: score_list[index],
+        reverse=True,
+    )
     true_positive_count = 0
-    precision_sum = 0.0
-    for rank, (_, label) in enumerate(pairs, start=1):
-        if label:
-            true_positive_count += 1
-            precision_sum += true_positive_count / float(rank)
-    return precision_sum / float(num_positive)
+    false_positive_count = 0
+    previous_recall = 0.0
+    average_precision = 0.0
+    index = 0
+    while index < len(sorted_indices):
+        tied_score = score_list[sorted_indices[index]]
+        tied_true_positive_count = 0
+        tied_false_positive_count = 0
+        while (
+            index < len(sorted_indices)
+            and score_list[sorted_indices[index]] == tied_score
+        ):
+            label = label_list[sorted_indices[index]]
+            if label:
+                tied_true_positive_count += 1
+            else:
+                tied_false_positive_count += 1
+            index += 1
+        true_positive_count += tied_true_positive_count
+        false_positive_count += tied_false_positive_count
+        if tied_true_positive_count:
+            recall = true_positive_count / float(num_positive)
+            precision = true_positive_count / float(
+                true_positive_count + false_positive_count
+            )
+            average_precision += (recall - previous_recall) * precision
+            previous_recall = recall
+    return average_precision
 
 
 def compute_binary_metrics_from_scores(scores: Sequence[float], labels: Sequence[int], threshold: float) -> Dict[str, Any]:
@@ -511,7 +542,145 @@ def _extract_scores_labels_from_logits(logits: Any, target: Any) -> Dict[str, Li
     return {"scores": [float(score) for score in scores], "labels": [int(label) for label in labels]}
 
 
-def _eval_logits_and_target(model: MemGraphDenseKnownNodes, mapped: Mapping[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+def _extract_node_scores_labels_from_logits(logits: Any, target: Any) -> Dict[str, List[Any]]:
+    logits_tensor = _as_tensor(logits)
+    target_tensor = _as_tensor(target)
+    if logits_tensor.dim() != 1 or target_tensor.dim() != 1:
+        raise ValueError("node logits and target must have shape [N]")
+    if logits_tensor.shape != target_tensor.shape:
+        raise ValueError("node logits and target must have matching shapes")
+    scores = torch.sigmoid(logits_tensor).detach().cpu().tolist()
+    labels = target_tensor.long().detach().cpu().tolist()
+    return {"scores": [float(score) for score in scores], "labels": [int(label) for label in labels]}
+
+
+def compute_node_binary_score_metrics(
+    scores: Sequence[float],
+    labels: Sequence[int],
+    *,
+    loss_value: Optional[float] = None,
+    scaled_loss_value: Optional[float] = None,
+) -> Dict[str, Any]:
+    score_list = [float(score) for score in scores]
+    label_list = [int(label) for label in labels]
+    if len(score_list) != len(label_list):
+        raise ValueError("scores and labels must have matching lengths")
+    if any(label not in (0, 1) for label in label_list):
+        raise ValueError("labels must be binary 0/1")
+    num_nodes = len(label_list)
+    num_positive = sum(label_list)
+    num_negative = num_nodes - num_positive
+    at_05 = compute_binary_metrics_from_scores(score_list, label_list, 0.5)
+    ap = compute_average_precision(score_list, label_list)
+    base_rate = float(num_positive / num_nodes) if num_nodes else None
+    return {
+        "num_nodes": int(num_nodes),
+        "num_positive": int(num_positive),
+        "num_negative": int(num_negative),
+        "positive_rate": base_rate,
+        "base_rate": base_rate,
+        "ap": ap,
+        "average_precision": ap,
+        "ap_over_base_rate": (ap / base_rate) if ap is not None and base_rate else None,
+        "metrics_at_threshold_0_5": at_05,
+        "precision_at_threshold_0_5": at_05["precision"],
+        "recall_at_threshold_0_5": at_05["recall"],
+        "f1_at_threshold_0_5": at_05["f1"],
+        "bce_loss": loss_value,
+        "scaled_bce_loss": scaled_loss_value,
+    }
+
+
+def _compute_visible_blocks_hidden_aux_metrics(
+    logits: Any,
+    target: Any,
+    *,
+    loss_weight: float,
+    pos_weight: float,
+) -> Dict[str, Any]:
+    logits_tensor = _as_tensor(logits)
+    target_tensor = _as_tensor(target)
+    selected = _extract_node_scores_labels_from_logits(logits_tensor, target_tensor)
+    loss = node_binary_bce_loss(logits_tensor, target_tensor, pos_weight=pos_weight)
+    loss_value = float(loss.detach().cpu().item())
+    metrics = compute_node_binary_score_metrics(
+        selected["scores"],
+        selected["labels"],
+        loss_value=loss_value,
+        scaled_loss_value=float(loss_weight) * loss_value,
+    )
+    metrics["pos_weight"] = float(pos_weight)
+    return metrics
+
+
+def _empty_visible_blocks_hidden_aux_metrics(
+    *,
+    enabled: bool,
+    loss_weight: float,
+    pos_weight: float,
+) -> Dict[str, Any]:
+    metrics = compute_node_binary_score_metrics([], [], loss_value=None, scaled_loss_value=None)
+    metrics["pos_weight"] = float(pos_weight)
+    return {
+        "enabled": bool(enabled),
+        "loss_weight": float(loss_weight),
+        "pos_weight": float(pos_weight),
+        "available_records": 0,
+        **metrics,
+    }
+
+
+def _aggregate_visible_blocks_hidden_aux_metrics(
+    records: Sequence[Mapping[str, Dict[str, List[Any]]]],
+    *,
+    enabled: bool,
+    loss_weight: float,
+    pos_weight: float,
+) -> Dict[str, Any]:
+    if not enabled:
+        return {
+            "enabled": False,
+            "loss_weight": float(loss_weight),
+            "pos_weight": float(pos_weight),
+            "available_records": 0,
+        }
+    if not records:
+        return _empty_visible_blocks_hidden_aux_metrics(
+            enabled=True,
+            loss_weight=loss_weight,
+            pos_weight=pos_weight,
+        )
+
+    logits: List[float] = []
+    labels: List[int] = []
+    for record in records:
+        logits.extend(float(value) for value in record.get("logits", []))
+        labels.extend(int(value) for value in record.get("labels", []))
+    if not logits:
+        return _empty_visible_blocks_hidden_aux_metrics(
+            enabled=True,
+            loss_weight=loss_weight,
+            pos_weight=pos_weight,
+        )
+    logits_tensor = torch.tensor(logits, dtype=torch.float32)
+    labels_tensor = torch.tensor(labels, dtype=torch.float32)
+    loss = node_binary_bce_loss(logits_tensor, labels_tensor, pos_weight=pos_weight)
+    loss_value = float(loss.detach().cpu().item())
+    scores = torch.sigmoid(logits_tensor).tolist()
+    result = compute_node_binary_score_metrics(
+        scores,
+        labels,
+        loss_value=loss_value,
+        scaled_loss_value=float(loss_weight) * loss_value,
+    )
+    result["enabled"] = True
+    result["loss_weight"] = float(loss_weight)
+    result["pos_weight"] = float(pos_weight)
+    result["available_records"] = int(len(records))
+    return result
+
+
+def _eval_output_and_target(model: MemGraphDenseKnownNodes, mapped: Mapping[str, Any]) -> Tuple[Mapping[str, Any], torch.Tensor]:
     was_training = model.training
     model.eval()
     with torch.no_grad():
@@ -520,8 +689,13 @@ def _eval_logits_and_target(model: MemGraphDenseKnownNodes, mapped: Mapping[str,
         model.train()
     if len(outputs) != 1:
         raise ValueError("expected one eval output, got {}".format(len(outputs)))
-    logits = outputs[0]["graph_logits"].detach().cpu()
     target = mapped["graph_gt"].detach().cpu()
+    return outputs[0], target
+
+
+def _eval_logits_and_target(model: MemGraphDenseKnownNodes, mapped: Mapping[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    output, target = _eval_output_and_target(model, mapped)
+    logits = output["graph_logits"].detach().cpu()
     return logits, target
 
 
@@ -584,6 +758,8 @@ def _option2b_metadata_from_mapped(mapped: Mapping[str, Any]) -> Dict[str, Any]:
         "invalid_class_observed_instance_ids",
         "observed_induced_source_gt_indices",
         "observed_node_records",
+        "visible_blocks_hidden_target",
+        "num_visible_blocks_hidden_positive",
         "num_observed_visible_instances",
         "num_gt_aligned_instances",
         "num_hidden_gt_instances",
@@ -850,13 +1026,35 @@ def evaluate_mem_graph_model(
     per_record: List[Dict[str, Any]] = []
     target_summaries: List[Dict[str, Any]] = []
     written_dumps: List[Dict[str, Any]] = []
+    aux_enabled = bool(getattr(model, "visible_blocks_hidden_aux_enabled", False))
+    aux_loss_weight = float(getattr(model, "visible_blocks_hidden_aux_loss_weight", 0.0))
+    aux_pos_weight = float(getattr(model, "visible_blocks_hidden_aux_pos_weight", 0.0))
+    aux_record_values: List[Dict[str, List[Any]]] = []
     for mapped in mapped_items:
-        logits, target = _eval_logits_and_target(model, mapped)
+        output, target = _eval_output_and_target(model, mapped)
+        logits = output["graph_logits"].detach().cpu()
         selected = _extract_scores_labels_from_logits(logits, target)
         record_target_summary = summarize_edge_targets(target)
         record_metrics = compute_mem_graph_score_metrics(
             selected["scores"], selected["labels"], thresholds=thresholds
         ) if selected["labels"] else {}
+        record_aux_metrics: Dict[str, Any] = {}
+        if aux_enabled and "visible_blocks_hidden_target" in mapped and "visible_blocks_hidden_logits" in output:
+            aux_logits = output["visible_blocks_hidden_logits"].detach().cpu()
+            aux_target = mapped["visible_blocks_hidden_target"].detach().cpu()
+            record_aux_metrics = _compute_visible_blocks_hidden_aux_metrics(
+                aux_logits,
+                aux_target,
+                loss_weight=aux_loss_weight,
+                pos_weight=aux_pos_weight,
+            )
+            selected_aux = _extract_node_scores_labels_from_logits(aux_logits, aux_target)
+            aux_record_values.append(
+                {
+                    "logits": [float(value) for value in aux_logits.tolist()],
+                    "labels": selected_aux["labels"],
+                }
+            )
         sample_id = str(mapped.get("image_id") or mapped.get("mem_metadata", {}).get("sample_id") or "")
         if dump_enabled and sample_id in dump_sample_ids:
             dump = build_mem_prediction_dump(
@@ -873,6 +1071,7 @@ def evaluate_mem_graph_model(
                 "image_id": mapped.get("image_id"),
                 "target_summary": record_target_summary,
                 "metrics": record_metrics,
+                "visible_blocks_hidden_aux_metrics": record_aux_metrics,
                 "mem_metadata": dict(mapped.get("mem_metadata", {}) or {}),
             }
         )
@@ -918,6 +1117,12 @@ def evaluate_mem_graph_model(
         "edge_count": aggregate["num_positive_directed_edges"],
         "pair_count": aggregate["num_non_diagonal_pairs"],
         "option2b_node_counts": _option2b_counts(mapped_items),
+        "visible_blocks_hidden_aux_metrics": _aggregate_visible_blocks_hidden_aux_metrics(
+            aux_record_values,
+            enabled=aux_enabled,
+            loss_weight=aux_loss_weight,
+            pos_weight=aux_pos_weight,
+        ),
         "per_record": per_record,
         "prediction_dumps": written_dumps,
         **score_metrics,
@@ -981,6 +1186,7 @@ def _compact_checkpoint_metrics(metrics: Mapping[str, Any]) -> Dict[str, Any]:
         "mean_positive_probability",
         "mean_negative_probability",
         "positive_negative_probability_gap",
+        "visible_blocks_hidden_aux_metrics",
     )
     return {key: _to_jsonable(metrics.get(key)) for key in keys if key in metrics}
 
@@ -1133,25 +1339,42 @@ def _train_model(
         model.train()
         optimizer.zero_grad(set_to_none=True)
         losses = model([dict(mapped)])
-        loss = losses.get("loss_mem_dense_graph")
-        if loss is None:
+        graph_loss = losses.get("loss_mem_dense_graph")
+        if graph_loss is None:
             raise ValueError("model did not return loss_mem_dense_graph")
+        finite_losses = {
+            name: value
+            for name, value in losses.items()
+            if name.startswith("loss_") and isinstance(value, torch.Tensor)
+        }
+        if not finite_losses:
+            raise ValueError("model did not return any scalar loss tensors")
+        loss = sum(finite_losses.values())
+        for loss_name, loss_value in finite_losses.items():
+            if not torch.isfinite(loss_value).all().item():
+                raise FloatingPointError("non-finite {} at iteration {}".format(loss_name, iteration))
         if not torch.isfinite(loss).all().item():
-            raise FloatingPointError("non-finite loss_mem_dense_graph at iteration {}".format(iteration))
+            raise FloatingPointError("non-finite total loss at iteration {}".format(iteration))
         loss.backward()
         grad_norm = _total_gradient_norm(model)
         optimizer.step()
-        history.append(
-            {
-                "iteration": int(iteration),
-                "image_id": mapped.get("image_id"),
-                "loss_mem_dense_graph": float(loss.detach().cpu().item()),
-                "loss_mem_dense_graph_finite": bool(torch.isfinite(loss.detach()).all().item()),
-                "grad_norm_total": grad_norm["value"],
-                "grad_norm_total_finite": grad_norm["finite"],
-                "grad_norm_saw_grad": grad_norm["saw_grad"],
-            }
-        )
+        history_record = {
+            "iteration": int(iteration),
+            "image_id": mapped.get("image_id"),
+            "loss_total": float(loss.detach().cpu().item()),
+            "loss_total_finite": bool(torch.isfinite(loss.detach()).all().item()),
+            "loss_mem_dense_graph": float(graph_loss.detach().cpu().item()),
+            "loss_mem_dense_graph_finite": bool(torch.isfinite(graph_loss.detach()).all().item()),
+            "grad_norm_total": grad_norm["value"],
+            "grad_norm_total_finite": grad_norm["finite"],
+            "grad_norm_saw_grad": grad_norm["saw_grad"],
+        }
+        for loss_name, loss_value in sorted(finite_losses.items()):
+            if loss_name == "loss_mem_dense_graph":
+                continue
+            history_record[loss_name] = float(loss_value.detach().cpu().item())
+            history_record["{}_finite".format(loss_name)] = bool(torch.isfinite(loss_value.detach()).all().item())
+        history.append(history_record)
         if checkpoint_enabled and (
             (iteration + 1) % int(checkpoint_eval_period) == 0 or (iteration + 1) == int(max_iter)
         ):
@@ -1384,6 +1607,9 @@ def run_mem_graph_training(
         "train_target_summary": train_target_summary,
         "graph_loss_pos_weight": float(graph_loss_pos_weight["value"]),
         "graph_loss_pos_weight_source": str(graph_loss_pos_weight["source"]),
+        "visible_blocks_hidden_aux_enabled": bool(cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED),
+        "visible_blocks_hidden_aux_loss_weight": float(cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_LOSS_WEIGHT),
+        "visible_blocks_hidden_aux_pos_weight": float(cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_POS_WEIGHT),
         "splits": {},
     }
     prediction_dump_written: List[Dict[str, Any]] = []
@@ -1456,6 +1682,9 @@ def run_mem_graph_training(
         "mem_zero_map_node_features": bool(cfg.MODEL.MEM_GRAPH.ZERO_MAP_NODE_FEATURES),
         "mem_pair_geometry_enabled": bool(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED),
         "mem_pair_geometry_features": list(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES),
+        "mem_visible_blocks_hidden_aux_enabled": bool(cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED),
+        "mem_visible_blocks_hidden_aux_loss_weight": float(cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_LOSS_WEIGHT),
+        "mem_visible_blocks_hidden_aux_pos_weight": float(cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_POS_WEIGHT),
         "model_meta_architecture": str(cfg.MODEL.META_ARCHITECTURE),
         "graph_head_name": str(cfg.MODEL.GRAPH_HEAD.NAME),
         "device": str(device),

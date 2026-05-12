@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 import torch
 from detectron2.config import get_cfg
@@ -11,12 +12,23 @@ from models.mem_graph_dense import (
     MemMapEncoder,
     build_mem_pair_geometry_features,
     masked_dense_graph_bce_loss,
+    node_binary_bce_loss,
 )
 from utils.configs import add_dep_graph_config, add_detr_config
 
 
 class MemGraphDenseTest(unittest.TestCase):
-    def _cfg(self, *, height=32, width=40, hidden_dim=16, pair_geometry=False, zero_map_node_features=False):
+    def _cfg(
+        self,
+        *,
+        height=32,
+        width=40,
+        hidden_dim=16,
+        pair_geometry=False,
+        zero_map_node_features=False,
+        visible_blocks_hidden_aux=False,
+        visible_blocks_hidden_aux_pos_weight=2.0,
+    ):
         cfg = get_cfg()
         add_dep_graph_config(cfg)
         add_detr_config(cfg)
@@ -35,6 +47,8 @@ class MemGraphDenseTest(unittest.TestCase):
         cfg.MODEL.MEM_GRAPH.MASK_GRAPH_DIAGONAL = True
         cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED = pair_geometry
         cfg.MODEL.MEM_GRAPH.ZERO_MAP_NODE_FEATURES = zero_map_node_features
+        cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED = visible_blocks_hidden_aux
+        cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_POS_WEIGHT = visible_blocks_hidden_aux_pos_weight
         cfg.INPUT.MEM_EXPECTED_HEIGHT = height
         cfg.INPUT.MEM_EXPECTED_WIDTH = width
         return cfg
@@ -208,7 +222,102 @@ class MemGraphDenseTest(unittest.TestCase):
         self.assertEqual(outputs[0]["node_order_instance_ids"], [101, 102, 103])
         self.assertEqual(outputs[0]["graph_logits"].shape, torch.Size([3, 3]))
         self.assertEqual(outputs[0]["graph_probs"].shape, torch.Size([3, 3]))
+        self.assertNotIn("visible_blocks_hidden_logits", outputs[0])
         self.assertTrue(torch.isfinite(outputs[0]["graph_logits"]).all())
+
+    def test_visible_blocks_hidden_aux_forward_logits_are_config_gated(self):
+        torch.manual_seed(0)
+        cfg = self._cfg(hidden_dim=16, pair_geometry=True, visible_blocks_hidden_aux=True)
+        model = MemGraphDenseKnownNodes(cfg)
+        model.eval()
+        item = {
+            "image": torch.randn(30, 32, 40),
+            "height": 32,
+            "width": 40,
+            "image_id": "synthetic/visible_hidden_aux_eval",
+            "instances": self._instances(height=32, width=40),
+            "graph_gt": torch.zeros(3, 3, dtype=torch.long),
+            "visible_blocks_hidden_target": torch.tensor([0.0, 1.0, 1.0]),
+        }
+
+        with torch.no_grad():
+            outputs = model([item])
+
+        self.assertEqual(outputs[0]["visible_blocks_hidden_logits"].shape, torch.Size([3]))
+        self.assertEqual(outputs[0]["visible_blocks_hidden_probs"].shape, torch.Size([3]))
+        self.assertNotIn("hidden_blocks_visible_logits", outputs[0])
+        self.assertTrue(torch.isfinite(outputs[0]["visible_blocks_hidden_logits"]).all())
+
+    def test_visible_blocks_hidden_aux_loss_is_config_target_and_pos_weight_gated(self):
+        torch.manual_seed(0)
+        item = {
+            "image": torch.randn(30, 32, 40),
+            "height": 32,
+            "width": 40,
+            "image_id": "synthetic/visible_hidden_aux_train",
+            "instances": self._instances(height=32, width=40),
+            "graph_gt": torch.tensor(
+                [[0, 1, 0], [0, 0, 1], [0, 0, 0]],
+                dtype=torch.long,
+            ),
+            "visible_blocks_hidden_target": torch.tensor([1.0, 1.0, 1.0]),
+        }
+        disabled_model = MemGraphDenseKnownNodes(self._cfg(hidden_dim=16, visible_blocks_hidden_aux=False))
+        disabled_model.train()
+
+        disabled_losses = disabled_model([dict(item)])
+
+        self.assertEqual(set(disabled_losses.keys()), {"loss_mem_dense_graph"})
+
+        torch.manual_seed(0)
+        pos1_model = MemGraphDenseKnownNodes(
+            self._cfg(hidden_dim=16, visible_blocks_hidden_aux=True, visible_blocks_hidden_aux_pos_weight=1.0)
+        )
+        pos1_model.train()
+        pos1_losses = pos1_model([dict(item)])
+
+        self.assertEqual(
+            set(pos1_losses.keys()),
+            {
+                "loss_mem_dense_graph",
+                "loss_mem_visible_blocks_hidden_aux",
+            },
+        )
+        self.assertTrue(torch.isfinite(pos1_losses["loss_mem_visible_blocks_hidden_aux"]))
+
+        torch.manual_seed(0)
+        pos5_model = MemGraphDenseKnownNodes(
+            self._cfg(hidden_dim=16, visible_blocks_hidden_aux=True, visible_blocks_hidden_aux_pos_weight=5.0)
+        )
+        pos5_model.train()
+        pos5_losses = pos5_model([dict(item)])
+        self.assertAlmostEqual(
+            float(pos5_losses["loss_mem_visible_blocks_hidden_aux"]),
+            5.0 * float(pos1_losses["loss_mem_visible_blocks_hidden_aux"]),
+            places=5,
+        )
+        self.assertAlmostEqual(
+            float(
+                node_binary_bce_loss(
+                    torch.tensor([0.0]),
+                    torch.tensor([1.0]),
+                    pos_weight=5.0,
+                )
+            ),
+            5.0 * float(node_binary_bce_loss(torch.tensor([0.0]), torch.tensor([1.0]), pos_weight=1.0)),
+            places=6,
+        )
+
+        missing_target_losses = pos5_model(
+            [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key != "visible_blocks_hidden_target"
+                }
+            ]
+        )
+        self.assertEqual(set(missing_target_losses.keys()), {"loss_mem_dense_graph"})
 
     def test_mem_graph_dense_known_nodes_pair_geometry_enabled_returns_logits(self):
         torch.manual_seed(0)
@@ -269,6 +378,9 @@ class MemGraphDenseTest(unittest.TestCase):
         self.assertEqual(cfg.MODEL.GRAPH_HEAD.EDGE_FEATURES, "concat")
         self.assertFalse(cfg.MODEL.MEM_GRAPH.ZERO_MAP_NODE_FEATURES)
         self.assertFalse(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
+        self.assertFalse(cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED)
+        self.assertAlmostEqual(cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_LOSS_WEIGHT, 0.1)
+        self.assertAlmostEqual(cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_POS_WEIGHT, 2.0)
         self.assertEqual(cfg.SOLVER.IMS_PER_BATCH, 1)
         self.assertEqual(cfg.DATALOADER.NUM_WORKERS, 0)
 
@@ -282,7 +394,36 @@ class MemGraphDenseTest(unittest.TestCase):
         self.assertEqual(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
         self.assertFalse(cfg.MODEL.MEM_GRAPH.ZERO_MAP_NODE_FEATURES)
         self.assertTrue(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
+        self.assertFalse(cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED)
         self.assertIn("front_x_overlap_union", list(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES))
+
+    def test_option2b_pair_geometry_visible_hidden_aux_config_only_enables_aux_path(self):
+        pair_geometry_path = Path("configs/mem/option2b_observed_visible_nodes_pair_geometry.yaml")
+        pair_geometry_config_text = pair_geometry_path.read_text(encoding="utf-8")
+        self.assertNotIn("VISIBLE_BLOCKS_HIDDEN_AUX", pair_geometry_config_text)
+        self.assertNotIn("HIDDEN_DEPENDENCY_AUX", pair_geometry_config_text)
+
+        cfg_pair = get_cfg()
+        add_dep_graph_config(cfg_pair)
+        add_detr_config(cfg_pair)
+        cfg_pair.merge_from_file(str(pair_geometry_path))
+
+        cfg_aux = get_cfg()
+        add_dep_graph_config(cfg_aux)
+        add_detr_config(cfg_aux)
+        cfg_aux.merge_from_file("configs/mem/option2b_observed_visible_nodes_pair_geometry_visible_hidden_aux.yaml")
+
+        self.assertEqual(cfg_aux.INPUT.MEM_NODE_SOURCE, "observed_instance_maps")
+        self.assertEqual(cfg_aux.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
+        self.assertTrue(cfg_aux.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
+        self.assertTrue(cfg_aux.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED)
+        self.assertAlmostEqual(cfg_aux.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_LOSS_WEIGHT, 0.1)
+        self.assertAlmostEqual(cfg_aux.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_POS_WEIGHT, 2.0)
+        self.assertFalse(cfg_pair.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED)
+        self.assertEqual(
+            list(cfg_aux.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES),
+            list(cfg_pair.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES),
+        )
 
     def test_option2b_pair_geometry_zero_map_config_keeps_geometry_but_zeros_map_node_features(self):
         cfg = get_cfg()

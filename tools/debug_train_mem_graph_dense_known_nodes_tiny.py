@@ -87,18 +87,49 @@ def compute_average_precision(scores: Sequence[float], labels: Sequence[int]) ->
     that case.
     """
 
-    pairs = [(float(score), int(label)) for score, label in zip(scores, labels)]
-    num_positive = sum(label for _, label in pairs)
+    score_list = [float(score) for score in scores]
+    label_list = [int(label) for label in labels]
+    if len(score_list) != len(label_list):
+        raise ValueError("scores and labels must have matching lengths")
+    if any(label not in (0, 1) for label in label_list):
+        raise ValueError("labels must be binary 0/1 values")
+    num_positive = sum(label_list)
     if num_positive == 0:
         return None
-    pairs.sort(key=lambda item: item[0], reverse=True)
+    sorted_indices = sorted(
+        range(len(score_list)),
+        key=lambda index: score_list[index],
+        reverse=True,
+    )
     true_positive_count = 0
-    precision_sum = 0.0
-    for rank, (_, label) in enumerate(pairs, start=1):
-        if label:
-            true_positive_count += 1
-            precision_sum += true_positive_count / float(rank)
-    return precision_sum / float(num_positive)
+    false_positive_count = 0
+    previous_recall = 0.0
+    average_precision = 0.0
+    index = 0
+    while index < len(sorted_indices):
+        tied_score = score_list[sorted_indices[index]]
+        tied_true_positive_count = 0
+        tied_false_positive_count = 0
+        while (
+            index < len(sorted_indices)
+            and score_list[sorted_indices[index]] == tied_score
+        ):
+            label = label_list[sorted_indices[index]]
+            if label:
+                tied_true_positive_count += 1
+            else:
+                tied_false_positive_count += 1
+            index += 1
+        true_positive_count += tied_true_positive_count
+        false_positive_count += tied_false_positive_count
+        if tied_true_positive_count:
+            recall = true_positive_count / float(num_positive)
+            precision = true_positive_count / float(
+                true_positive_count + false_positive_count
+            )
+            average_precision += (recall - previous_recall) * precision
+            previous_recall = recall
+    return average_precision
 
 
 def summarize_edge_targets(target: Any) -> Dict[str, Any]:

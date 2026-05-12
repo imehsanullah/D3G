@@ -381,7 +381,19 @@ def build_observed_induced_mem_graph_contract(
     visible_aligned_set = set(aligned_ids)
     visible_gt_set = {instance_id for instance_id in observed_visible_ids if instance_id in gt_index_by_instance_id}
     hidden_gt_ids = [instance_id for instance_id in gt_node_order if instance_id not in visible_gt_set]
+    hidden_gt_indices = [int(gt_index_by_instance_id[instance_id]) for instance_id in hidden_gt_ids]
     dropped_gt_visible_ids = [instance_id for instance_id in gt_node_order if instance_id in visible_gt_set and instance_id not in visible_aligned_set]
+    if aligned_source_gt_indices and hidden_gt_indices:
+        aligned_index_tensor = torch.as_tensor(aligned_source_gt_indices, dtype=torch.long)
+        hidden_index_tensor = torch.as_tensor(hidden_gt_indices, dtype=torch.long)
+        visible_blocks_hidden_target = (
+            full_graph.index_select(0, aligned_index_tensor)
+            .index_select(1, hidden_index_tensor)
+            .any(dim=1)
+            .to(dtype=torch.float32)
+        )
+    else:
+        visible_blocks_hidden_target = torch.zeros((len(aligned_source_gt_indices),), dtype=torch.float32)
 
     return {
         "node_order_instance_ids": aligned_ids,
@@ -389,6 +401,7 @@ def build_observed_induced_mem_graph_contract(
         "bbox_categories": bbox_categories,
         "graph_gt": induced_graph,
         "dense_gt": induced_graph.clone(),
+        "visible_blocks_hidden_target": visible_blocks_hidden_target,
         "observed_node_records": observed_node_records,
         "metadata": {
             "observed_visible_instance_ids": observed_visible_ids,
@@ -400,6 +413,10 @@ def build_observed_induced_mem_graph_contract(
             "invalid_class_observed_instance_ids": invalid_class_observed_ids,
             "observed_induced_source_gt_indices": aligned_source_gt_indices,
             "observed_node_records": observed_node_records,
+            "visible_blocks_hidden_target": [
+                int(value) for value in visible_blocks_hidden_target.to(dtype=torch.long).tolist()
+            ],
+            "num_visible_blocks_hidden_positive": int(visible_blocks_hidden_target.sum().item()),
             "num_observed_visible_instances": len(observed_visible_ids),
             "num_gt_aligned_instances": len(aligned_ids),
             "num_unmatched_observed_instances": len(unmatched_observed_ids),
@@ -534,6 +551,7 @@ class MemObservedGtMapper:
             graph_gt = observed_contract["graph_gt"].to(dtype=torch.long)
             dense_gt = observed_contract["dense_gt"].to(dtype=torch.long)
             observed_induced_metadata = dict(observed_contract["metadata"])
+            visible_blocks_hidden_target = observed_contract["visible_blocks_hidden_target"].to(dtype=torch.float32)
             is_oracle_node_conditioned = False
 
         instances = structures.Instances(
@@ -543,7 +561,7 @@ class MemObservedGtMapper:
         )
         sample_id = record.get("sample_id") or str(pre_action_dir)
 
-        return {
+        output = {
             "width": width,
             "height": height,
             "image": torch.from_numpy(image_np.copy()).float(),
@@ -574,6 +592,9 @@ class MemObservedGtMapper:
                 "runs_training": False,
             },
         }
+        if self.mem_node_source == "observed_instance_maps":
+            output["visible_blocks_hidden_target"] = visible_blocks_hidden_target
+        return output
 
 
 __all__ = [

@@ -80,7 +80,7 @@ class MemObservedGtMapperTest(unittest.TestCase):
             "graph_gt": [
                 [0, 1, 1],
                 [0, 0, 1],
-                [0, 0, 0],
+                [1, 0, 0],
             ],
         }
 
@@ -254,6 +254,10 @@ class MemObservedGtMapperTest(unittest.TestCase):
             self.assertEqual(metadata["unmatched_observed_instance_ids"], [99])
             self.assertEqual(metadata["hidden_gt_instance_ids"], [33])
             self.assertEqual(metadata["observed_induced_source_gt_indices"], [0, 1])
+            self.assertNotIn("hidden_blocks_visible", out)
+            self.assertTrue(torch.equal(out["visible_blocks_hidden_target"], torch.tensor([1.0, 1.0])))
+            self.assertEqual(metadata["visible_blocks_hidden_target"], [1, 1])
+            self.assertEqual(metadata["num_visible_blocks_hidden_positive"], 2)
 
     def test_option2b_config_file_sets_node_source_and_target_scope(self):
         cfg = get_cfg()

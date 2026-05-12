@@ -101,6 +101,9 @@ def add_detr_config(cfg):
         'area_ratio_min_over_max',
         'front_x_overlap_union',
     ]
+    cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED = False
+    cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_LOSS_WEIGHT = 0.1
+    cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_POS_WEIGHT = 2.0
 
     cfg.MODEL.DETR.GRAPH_CRITEREON = 'cross'
     cfg.MODEL.DETR.GRAPH_WEIGHT = 1.0

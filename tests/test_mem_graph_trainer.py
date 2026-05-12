@@ -11,6 +11,7 @@ from detectron2.structures import Boxes, Instances
 
 from tools.train_mem_graph import (
     build_mem_prediction_dump,
+    compute_average_precision,
     compute_mem_graph_score_metrics,
     load_mem_graph_records_for_splits,
     load_mem_graph_split_manifest,
@@ -24,6 +25,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 OPTION2A_CONFIG = REPO_ROOT / "configs" / "mem" / "option2a_gt_known_nodes.yaml"
 OPTION2B_CONFIG = REPO_ROOT / "configs" / "mem" / "option2b_observed_visible_nodes.yaml"
 OPTION2B_PAIR_GEOMETRY_CONFIG = REPO_ROOT / "configs" / "mem" / "option2b_observed_visible_nodes_pair_geometry.yaml"
+OPTION2B_PAIR_GEOMETRY_VISIBLE_HIDDEN_AUX_CONFIG = (
+    REPO_ROOT / "configs" / "mem" / "option2b_observed_visible_nodes_pair_geometry_visible_hidden_aux.yaml"
+)
 
 
 class MemGraphTrainerTest(unittest.TestCase):
@@ -51,7 +55,13 @@ class MemGraphTrainerTest(unittest.TestCase):
             depths=np.zeros((10, 16, 16), dtype=np.float32),
         )
 
-    def _write_records_and_split(self, tmpdir: Path, *, option2b_instances: bool = False):
+    def _write_records_and_split(
+        self,
+        tmpdir: Path,
+        *,
+        option2b_instances: bool = False,
+        hidden_gt_node: bool = False,
+    ):
         records = []
         split_ids = {"train": [], "val": [], "test": []}
         split_scene = {"train": "scene0", "val": "scene1", "test": "scene2"}
@@ -59,6 +69,16 @@ class MemGraphTrainerTest(unittest.TestCase):
             sample_id = f"{scene}/000000000"
             pre_action_dir = tmpdir / scene / "000000000" / "pre_action"
             self._write_hms_npz(pre_action_dir, option2b_instances=option2b_instances)
+            if hidden_gt_node:
+                bbox_xyxy_abs = [[0, 0, 5, 4], [5, 4, 12, 8], [0, 4, 5, 8]]
+                bbox_categories = [0, 1, 2]
+                node_order_instance_ids = [1, 2, 4]
+                graph_gt = [[0, 1, 0], [0, 0, 1], [1, 0, 0]]
+            else:
+                bbox_xyxy_abs = [[0, 0, 5, 4], [5, 4, 12, 8]]
+                bbox_categories = [0, 1]
+                node_order_instance_ids = [1, 2]
+                graph_gt = [[0, 1], [0, 0]]
             records.append(
                 {
                     "sample_id": sample_id,
@@ -66,11 +86,11 @@ class MemGraphTrainerTest(unittest.TestCase):
                     "selected_view_indices": list(range(10)),
                     "height": 8,
                     "width": 12,
-                    "bbox_xyxy_abs": [[0, 0, 5, 4], [5, 4, 12, 8]],
-                    "bbox_categories": [0, 1],
-                    "node_order_instance_ids": [1, 2],
-                    "graph_gt": [[0, 1], [0, 0]],
-                    "dense_gt": [[0, 1], [0, 0]],
+                    "bbox_xyxy_abs": bbox_xyxy_abs,
+                    "bbox_categories": bbox_categories,
+                    "node_order_instance_ids": node_order_instance_ids,
+                    "graph_gt": graph_gt,
+                    "dense_gt": graph_gt,
                     "scene": scene,
                 }
             )
@@ -120,6 +140,18 @@ class MemGraphTrainerTest(unittest.TestCase):
         self.assertEqual(cfg_2a.INPUT.MEM_GRAPH_TARGET_SCOPE, "gt_all")
         self.assertEqual(cfg_2b.INPUT.MEM_NODE_SOURCE, "observed_instance_maps")
         self.assertEqual(cfg_2b.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
+        self.assertFalse(cfg_2b.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED)
+
+        cfg_aux = setup_mem_graph_cfg(
+            OPTION2B_PAIR_GEOMETRY_VISIBLE_HIDDEN_AUX_CONFIG,
+            device="cpu",
+            cfg_overrides=self._tiny_overrides(),
+        )
+        self.assertEqual(cfg_aux.INPUT.MEM_NODE_SOURCE, "observed_instance_maps")
+        self.assertEqual(cfg_aux.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
+        self.assertTrue(cfg_aux.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
+        self.assertTrue(cfg_aux.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED)
+        self.assertAlmostEqual(cfg_aux.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_POS_WEIGHT, 2.0)
 
     def test_manifest_loading_registers_scene_disjoint_splits(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -164,6 +196,30 @@ class MemGraphTrainerTest(unittest.TestCase):
         self.assertGreater(metrics["best_f1"], at_05["f1"])
         self.assertAlmostEqual(metrics["positive_negative_probability_gap"], 0.1)
         self.assertNotIn("score_histogram", metrics)
+
+    def test_average_precision_groups_tied_scores(self):
+        self.assertAlmostEqual(
+            compute_average_precision(
+                scores=[0.5, 0.5, 0.5, 0.5],
+                labels=[1, 0, 1, 0],
+            ),
+            0.5,
+        )
+        self.assertAlmostEqual(
+            compute_average_precision(
+                scores=[0.5, 0.5, 0.5, 0.5],
+                labels=[0, 1, 0, 1],
+            ),
+            0.5,
+        )
+        metrics = compute_mem_graph_score_metrics(
+            scores=[0.5, 0.5, 0.5, 0.5],
+            labels=[1, 0, 1, 0],
+            thresholds=[0.5],
+        )
+
+        self.assertAlmostEqual(metrics["validation_ap"], 0.5)
+        self.assertAlmostEqual(metrics["ap_over_base_rate"], 1.0)
 
     def test_score_histogram_is_opt_in(self):
         metrics = compute_mem_graph_score_metrics(
@@ -407,7 +463,58 @@ class MemGraphTrainerTest(unittest.TestCase):
             self.assertFalse(summary["safety"]["writes_checkpoints_or_model_outputs"])
             saved_config = (output_dir / "config.yaml").read_text(encoding="utf-8")
             self.assertIn("PAIR_GEOMETRY_ENABLED: true", saved_config)
+            self.assertIn("VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED: false", saved_config)
             self.assertFalse(any(path.suffix in {".pth", ".pt", ".ckpt", ".h5", ".hdf5"} for path in output_dir.rglob("*")))
+
+    def test_tiny_option2b_pair_geometry_visible_hidden_aux_reports_separate_metrics_and_losses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            records_json, split_json, _ = self._write_records_and_split(
+                tmpdir,
+                option2b_instances=True,
+                hidden_gt_node=True,
+            )
+            output_dir = tmpdir / "option2b_pair_geometry_visible_hidden_aux_run"
+
+            summary = run_mem_graph_training(
+                config_file=OPTION2B_PAIR_GEOMETRY_VISIBLE_HIDDEN_AUX_CONFIG,
+                records_json=records_json,
+                split_json=split_json,
+                output_dir=output_dir,
+                data_root=str(tmpdir),
+                device="cpu",
+                max_iter=1,
+                seed=0,
+                cfg_overrides=self._tiny_overrides(),
+                enable_checkpoints=False,
+                thresholds=[0.5, 0.3, 0.15],
+            )
+
+            self.assertTrue(summary["mem_pair_geometry_enabled"])
+            self.assertTrue(summary["mem_visible_blocks_hidden_aux_enabled"])
+            self.assertAlmostEqual(summary["mem_visible_blocks_hidden_aux_loss_weight"], 0.1)
+            self.assertAlmostEqual(summary["mem_visible_blocks_hidden_aux_pos_weight"], 2.0)
+            self.assertIn("loss_mem_visible_blocks_hidden_aux", summary["train_history"][0])
+            self.assertNotIn("loss_mem_hidden_blocks_visible_aux", summary["train_history"][0])
+            self.assertIn("validation_ap", summary["validation_metrics"])
+            aux_metrics = summary["validation_metrics"]["visible_blocks_hidden_aux_metrics"]
+            self.assertTrue(aux_metrics["enabled"])
+            self.assertEqual(aux_metrics["available_records"], 1)
+            self.assertEqual(aux_metrics["num_nodes"], 2)
+            self.assertEqual(aux_metrics["num_positive"], 1)
+            self.assertEqual(aux_metrics["num_negative"], 1)
+            self.assertAlmostEqual(aux_metrics["base_rate"], 0.5)
+            self.assertAlmostEqual(aux_metrics["positive_rate"], 0.5)
+            self.assertIsNotNone(aux_metrics["ap"])
+            self.assertIsNotNone(aux_metrics["ap_over_base_rate"])
+            self.assertIn("f1", aux_metrics["metrics_at_threshold_0_5"])
+            self.assertIsNotNone(aux_metrics["bce_loss"])
+            self.assertIsNotNone(aux_metrics["scaled_bce_loss"])
+            self.assertAlmostEqual(aux_metrics["pos_weight"], 2.0)
+            saved_config = (output_dir / "config.yaml").read_text(encoding="utf-8")
+            self.assertIn("VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED: true", saved_config)
+            self.assertIn("VISIBLE_BLOCKS_HIDDEN_AUX_POS_WEIGHT: 2.0", saved_config)
+            self.assertFalse(summary["safety"]["writes_checkpoints_or_model_outputs"])
 
     def test_controlled_checkpointing_writes_best_validation_and_final_only_to_checkpoint_dir(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -103,6 +103,27 @@ def masked_dense_graph_bce_loss(
     return loss, diagnostics
 
 
+def node_binary_bce_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    pos_weight: Optional[float] = None,
+) -> torch.Tensor:
+    if logits.dim() != 1:
+        raise ValueError(f"node binary logits must have shape [N], got {tuple(logits.shape)}")
+    target = target.to(device=logits.device, dtype=logits.dtype)
+    if target.shape != logits.shape:
+        raise ValueError(
+            f"node binary logits and target must have the same shape, got {tuple(logits.shape)} and {tuple(target.shape)}"
+        )
+    if not torch.all((target == 0) | (target == 1)):
+        raise ValueError("node binary target must be binary with values 0/1")
+    pos_weight_tensor = None
+    if pos_weight is not None and float(pos_weight) > 0.0:
+        pos_weight_tensor = torch.tensor(float(pos_weight), dtype=logits.dtype, device=logits.device)
+    return F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight_tensor)
+
+
 class MemInputNormalizer(nn.Module):
     """Normalize MEM map tensors while preserving the mapper channel contract."""
 
@@ -399,6 +420,9 @@ class MemGraphDenseKnownNodes(nn.Module):
         self.require_known_nodes = bool(mem_cfg.REQUIRE_KNOWN_NODES)
         self.zero_map_node_features = bool(mem_cfg.ZERO_MAP_NODE_FEATURES)
         self.pair_geometry_enabled = bool(mem_cfg.PAIR_GEOMETRY_ENABLED)
+        self.visible_blocks_hidden_aux_enabled = bool(mem_cfg.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED)
+        self.visible_blocks_hidden_aux_loss_weight = float(mem_cfg.VISIBLE_BLOCKS_HIDDEN_AUX_LOSS_WEIGHT)
+        self.visible_blocks_hidden_aux_pos_weight = float(mem_cfg.VISIBLE_BLOCKS_HIDDEN_AUX_POS_WEIGHT)
         self.pair_geometry_feature_names: Tuple[str, ...] = (
             _normalise_pair_geometry_feature_names(mem_cfg.PAIR_GEOMETRY_FEATURES)
             if self.pair_geometry_enabled
@@ -428,6 +452,8 @@ class MemGraphDenseKnownNodes(nn.Module):
             edge_features=graph_cfg.EDGE_FEATURES,
             extra_edge_feature_dim=len(self.pair_geometry_feature_names),
         )
+        if self.visible_blocks_hidden_aux_enabled:
+            self.visible_blocks_hidden_head = nn.Linear(int(mem_cfg.HIDDEN_DIM), 1)
         self.to(self.device)
 
     def forward(self, batched_inputs: Sequence[Dict[str, object]]):
@@ -463,6 +489,9 @@ class MemGraphDenseKnownNodes(nn.Module):
             ).to(device=self.device, dtype=node_tokens.dtype)
 
         graph_logits = self._predict_graph_logits(node_tokens, pair_geometry_features=pair_geometry_features)
+        visible_blocks_hidden_logits: Optional[torch.Tensor] = None
+        if self.visible_blocks_hidden_aux_enabled:
+            visible_blocks_hidden_logits = self._predict_visible_blocks_hidden_logits(node_tokens)
         if self.training:
             target = item.get("graph_gt", item.get("dense_gt"))
             if target is None:
@@ -476,21 +505,33 @@ class MemGraphDenseKnownNodes(nn.Module):
                 pos_weight=self.graph_loss_pos_weight,
                 return_diagnostics=False,
             )
-            return {"loss_mem_dense_graph": loss}
+            losses = {"loss_mem_dense_graph": loss}
+            if self.visible_blocks_hidden_aux_enabled and visible_blocks_hidden_logits is not None:
+                aux_weight = float(self.visible_blocks_hidden_aux_loss_weight)
+                if "visible_blocks_hidden_target" in item:
+                    visible_target = item["visible_blocks_hidden_target"].to(self.device)
+                    losses["loss_mem_visible_blocks_hidden_aux"] = aux_weight * node_binary_bce_loss(
+                        visible_blocks_hidden_logits,
+                        visible_target,
+                        pos_weight=self.visible_blocks_hidden_aux_pos_weight,
+                    )
+            return losses
 
         metadata = item.get("mem_metadata", {}) or {}
         graph_probs = torch.sigmoid(graph_logits)
-        return [
-            {
-                "image_id": item.get("image_id"),
-                "num_nodes": num_nodes,
-                "graph_logits": graph_logits,
-                "graph_probs": graph_probs,
-                "node_order_instance_ids": metadata.get("node_order_instance_ids", []),
-                "pair_geometry_feature_names": list(self.pair_geometry_feature_names),
-                "zero_map_node_features": self.zero_map_node_features,
-            }
-        ]
+        output = {
+            "image_id": item.get("image_id"),
+            "num_nodes": num_nodes,
+            "graph_logits": graph_logits,
+            "graph_probs": graph_probs,
+            "node_order_instance_ids": metadata.get("node_order_instance_ids", []),
+            "pair_geometry_feature_names": list(self.pair_geometry_feature_names),
+            "zero_map_node_features": self.zero_map_node_features,
+        }
+        if self.visible_blocks_hidden_aux_enabled and visible_blocks_hidden_logits is not None:
+            output["visible_blocks_hidden_logits"] = visible_blocks_hidden_logits
+            output["visible_blocks_hidden_probs"] = torch.sigmoid(visible_blocks_hidden_logits)
+        return [output]
 
     def _predict_graph_logits(
         self,
@@ -501,3 +542,6 @@ class MemGraphDenseKnownNodes(nn.Module):
         hs = node_tokens.unsqueeze(0).unsqueeze(0)  # [L=1, B=1, Q, C]
         graph_logits = self.graph_head(hs, edge_extra_features=pair_geometry_features)[-1, 0, :, :, 0]
         return graph_logits
+
+    def _predict_visible_blocks_hidden_logits(self, node_tokens: torch.Tensor) -> torch.Tensor:
+        return self.visible_blocks_hidden_head(node_tokens).squeeze(-1)

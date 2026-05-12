@@ -293,6 +293,24 @@ class MemKnownNodeTinyTrainDebugTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["recall"], 1.0)
         self.assertAlmostEqual(metrics["f1"], 1.0)
         self.assertAlmostEqual(metrics["average_precision"], 1.0)
+
+    def test_average_precision_groups_tied_scores(self):
+        self.assertAlmostEqual(
+            compute_average_precision(
+                scores=[0.5, 0.5, 0.5, 0.5],
+                labels=[1, 0, 1, 0],
+            ),
+            0.5,
+        )
+        diagnostics = compute_score_distribution_diagnostics(
+            scores=[0.5, 0.5, 0.5, 0.5],
+            labels=[1, 0, 1, 0],
+            thresholds=[0.5],
+        )
+
+        self.assertAlmostEqual(diagnostics["average_precision"], 0.5)
+        self.assertAlmostEqual(diagnostics["average_precision_over_base_rate"], 1.0)
+
     def test_score_distribution_diagnostics_reports_sweep_histogram_and_best_threshold(self):
         diagnostics = compute_score_distribution_diagnostics(
             scores=[0.92, 0.60, 0.40, 0.20],
