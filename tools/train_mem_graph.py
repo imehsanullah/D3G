@@ -274,6 +274,10 @@ def _build_mapper(cfg, *, data_root: str, is_train: bool) -> MemObservedGtMapper
         validate_semantic_range=bool(cfg.INPUT.MEM_VALIDATE_SEMANTIC_RANGE),
         mem_node_source=cfg.INPUT.MEM_NODE_SOURCE,
         mem_graph_target_scope=cfg.INPUT.MEM_GRAPH_TARGET_SCOPE,
+        mem_box_mode=cfg.INPUT.MEM_BOX_MODE,
+        mem_map_feature_source=cfg.INPUT.MEM_MAP_FEATURE_SOURCE,
+        cnabu_derived_root=cfg.DATASETS.MEM_CNABU_DERIVED_ROOT,
+        cnabu_pad_mode=cfg.INPUT.MEM_CNABU_PAD_MODE,
     )
 
 
@@ -1549,6 +1553,8 @@ def run_mem_graph_training(
     cfg.DATASETS.MEM_RECORDS_JSON = str(records_path)
     cfg.DATASETS.MEM_SPLIT_JSON = str(split_path)
     cfg.DATASETS.ROOT = data_root_value
+    if getattr(cfg.DATASETS, "MEM_CNABU_DERIVED_ROOT", ""):
+        cfg.DATASETS.MEM_CNABU_DERIVED_ROOT = str(Path(cfg.DATASETS.MEM_CNABU_DERIVED_ROOT).expanduser())
     cfg.SOLVER.MAX_ITER = int(max_iter)
     cfg.OUTPUT_DIR = str(output_path)
     cfg.MODEL.MEM_GRAPH.LOSS_MODE = loss_mode
@@ -1677,6 +1683,11 @@ def run_mem_graph_training(
         "records_json": str(records_path),
         "split_json": str(split_path),
         "data_root": data_root_value,
+        "mem_map_feature_source": str(cfg.INPUT.MEM_MAP_FEATURE_SOURCE),
+        "mem_cnabu_derived_root": str(cfg.DATASETS.MEM_CNABU_DERIVED_ROOT),
+        "mem_cnabu_pad_mode": str(cfg.INPUT.MEM_CNABU_PAD_MODE),
+        "mem_input_channels": int(cfg.MODEL.MEM_GRAPH.IN_CHANNELS),
+        "mem_input_normalization": str(cfg.MODEL.MEM_GRAPH.INPUT_NORMALIZATION),
         "mem_node_source": str(cfg.INPUT.MEM_NODE_SOURCE),
         "mem_graph_target_scope": str(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE),
         "mem_zero_map_node_features": bool(cfg.MODEL.MEM_GRAPH.ZERO_MAP_NODE_FEATURES),

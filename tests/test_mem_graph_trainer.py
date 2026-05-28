@@ -28,6 +28,15 @@ OPTION2B_PAIR_GEOMETRY_CONFIG = REPO_ROOT / "configs" / "mem" / "option2b_observ
 OPTION2B_PAIR_GEOMETRY_VISIBLE_HIDDEN_AUX_CONFIG = (
     REPO_ROOT / "configs" / "mem" / "option2b_observed_visible_nodes_pair_geometry_visible_hidden_aux.yaml"
 )
+OPTION2B_PAIR_GEOMETRY_OBB_CONFIG = (
+    REPO_ROOT / "configs" / "mem" / "option2b_observed_visible_nodes_pair_geometry_obb.yaml"
+)
+OPTION2B_PAIR_GEOMETRY_CNABU_MEAN_CONFIG = (
+    REPO_ROOT / "configs" / "mem" / "option2b_observed_visible_nodes_pair_geometry_cnabu_mean.yaml"
+)
+OPTION2B_PAIR_GEOMETRY_RAW_PLUS_CNABU_MEAN_CONFIG = (
+    REPO_ROOT / "configs" / "mem" / "option2b_observed_visible_nodes_pair_geometry_raw_plus_cnabu_mean.yaml"
+)
 
 
 class MemGraphTrainerTest(unittest.TestCase):
@@ -152,6 +161,28 @@ class MemGraphTrainerTest(unittest.TestCase):
         self.assertTrue(cfg_aux.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
         self.assertTrue(cfg_aux.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED)
         self.assertAlmostEqual(cfg_aux.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_POS_WEIGHT, 2.0)
+
+        cfg_cnabu = setup_mem_graph_cfg(
+            OPTION2B_PAIR_GEOMETRY_CNABU_MEAN_CONFIG,
+            device="cpu",
+            cfg_overrides=self._tiny_overrides(),
+        )
+        self.assertEqual(cfg_cnabu.INPUT.MEM_NODE_SOURCE, "observed_instance_maps")
+        self.assertEqual(cfg_cnabu.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
+        self.assertEqual(cfg_cnabu.INPUT.MEM_MAP_FEATURE_SOURCE, "cnabu_mean")
+        self.assertEqual(cfg_cnabu.MODEL.MEM_GRAPH.IN_CHANNELS, 16)
+        self.assertEqual(cfg_cnabu.MODEL.MEM_GRAPH.INPUT_NORMALIZATION, "none")
+
+        cfg_concat = setup_mem_graph_cfg(
+            OPTION2B_PAIR_GEOMETRY_RAW_PLUS_CNABU_MEAN_CONFIG,
+            device="cpu",
+            cfg_overrides=self._tiny_overrides(),
+        )
+        self.assertEqual(cfg_concat.INPUT.MEM_NODE_SOURCE, "observed_instance_maps")
+        self.assertEqual(cfg_concat.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
+        self.assertEqual(cfg_concat.INPUT.MEM_MAP_FEATURE_SOURCE, "raw_plus_cnabu_mean")
+        self.assertEqual(cfg_concat.MODEL.MEM_GRAPH.IN_CHANNELS, 46)
+        self.assertEqual(cfg_concat.MODEL.MEM_GRAPH.INPUT_NORMALIZATION, "raw_plus_cnabu_mean_v0")
 
     def test_manifest_loading_registers_scene_disjoint_splits(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -465,6 +496,45 @@ class MemGraphTrainerTest(unittest.TestCase):
             self.assertIn("PAIR_GEOMETRY_ENABLED: true", saved_config)
             self.assertIn("VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED: false", saved_config)
             self.assertFalse(any(path.suffix in {".pth", ".pt", ".ckpt", ".h5", ".hdf5"} for path in output_dir.rglob("*")))
+
+    def test_tiny_option2b_pair_geometry_obb_train_eval_uses_obb_features(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            records_json, split_json, _ = self._write_records_and_split(tmpdir, option2b_instances=True)
+            output_dir = tmpdir / "option2b_pair_geometry_obb_run"
+
+            summary = run_mem_graph_training(
+                config_file=OPTION2B_PAIR_GEOMETRY_OBB_CONFIG,
+                records_json=records_json,
+                split_json=split_json,
+                output_dir=output_dir,
+                data_root=str(tmpdir),
+                device="cpu",
+                max_iter=1,
+                seed=0,
+                cfg_overrides=self._tiny_overrides(),
+                enable_checkpoints=False,
+                thresholds=[0.5, 0.3, 0.15],
+            )
+
+            self.assertEqual(summary["mem_node_source"], "observed_instance_maps")
+            self.assertEqual(summary["mem_graph_target_scope"], "observed_induced")
+            self.assertTrue(summary["mem_pair_geometry_enabled"])
+            for required in (
+                "front_x_overlap_union",
+                "relative_theta_sin",
+                "relative_theta_cos",
+                "obb_aspect_ratio_min_over_max",
+            ):
+                self.assertIn(required, summary["mem_pair_geometry_features"])
+            self.assertIn("validation_ap", summary["validation_metrics"])
+            self.assertFalse(summary["safety"]["writes_checkpoints_or_model_outputs"])
+            saved_config = (output_dir / "config.yaml").read_text(encoding="utf-8")
+            self.assertIn("MEM_BOX_MODE: obb_from_mask", saved_config)
+            self.assertIn("USE_OBB_FEATURES: true", saved_config)
+            self.assertFalse(
+                any(path.suffix in {".pth", ".pt", ".ckpt", ".h5", ".hdf5"} for path in output_dir.rglob("*"))
+            )
 
     def test_tiny_option2b_pair_geometry_visible_hidden_aux_reports_separate_metrics_and_losses(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -8,6 +8,7 @@ from detectron2.structures import Boxes, Instances
 
 from models.mem_graph_dense import (
     MemGraphDenseKnownNodes,
+    MemInputNormalizer,
     MemKnownNodeTokenExtractor,
     MemMapEncoder,
     build_mem_pair_geometry_features,
@@ -110,6 +111,19 @@ class MemGraphDenseTest(unittest.TestCase):
 
         self.assertEqual(features.shape, torch.Size([2, 32, 35, 50]))
         self.assertTrue(torch.isfinite(features).all())
+
+    def test_raw_plus_cnabu_normalizer_scales_only_raw_semantic_channels(self):
+        x = torch.ones(1, 46, 2, 2)
+        x[:, 2:30:3] = 14.0
+        x[:, 30:] = 0.25
+
+        normalizer = MemInputNormalizer(mode="raw_plus_cnabu_mean_v0", semantic_max_value=14.0)
+        y = normalizer(x)
+
+        self.assertTrue(torch.allclose(y[:, 2:30:3], torch.ones_like(y[:, 2:30:3])))
+        self.assertTrue(torch.allclose(y[:, 0:30:3], x[:, 0:30:3]))
+        self.assertTrue(torch.allclose(y[:, 1:30:3], x[:, 1:30:3]))
+        self.assertTrue(torch.allclose(y[:, 30:], x[:, 30:]))
 
     def test_known_node_token_extractor_uses_instance_order(self):
         torch.manual_seed(0)

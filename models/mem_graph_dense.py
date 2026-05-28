@@ -32,6 +32,12 @@ SUPPORTED_MEM_PAIR_GEOMETRY_FEATURES = (
     "area_ratio",
     "front_x_overlap_union",
     "front_x_overlap",
+    "relative_theta_sin",
+    "relative_theta_cos",
+    "obb_aspect_ratio_min_over_max",
+)
+OBB_PAIR_GEOMETRY_FEATURES = frozenset(
+    {"relative_theta_sin", "relative_theta_cos", "obb_aspect_ratio_min_over_max"}
 )
 
 
@@ -138,16 +144,25 @@ class MemInputNormalizer(nn.Module):
         x = x.float()
         if self.mode in ("none", "identity"):
             return x
-        if self.mode != "scaled_v0":
+        if self.mode not in ("scaled_v0", "raw_plus_cnabu_mean_v0"):
             raise ValueError(f"unsupported MEM input normalization mode: {self.mode}")
         if self.semantic_max_value <= 0:
             raise ValueError("semantic_max_value must be positive")
-        if x.shape[1] % 3 != 0:
+        raw_channels = x.shape[1]
+        if self.mode == "raw_plus_cnabu_mean_v0":
+            cnabu_mean_channels = 16
+            if x.shape[1] <= cnabu_mean_channels:
+                raise ValueError(
+                    "raw_plus_cnabu_mean_v0 expects raw view-major channels followed by 16 CNABU channels, "
+                    f"got {x.shape[1]} channels"
+                )
+            raw_channels = x.shape[1] - cnabu_mean_channels
+        if raw_channels % 3 != 0:
             raise ValueError(
-                f"scaled_v0 expects view-major MEM channels in groups of 3, got {x.shape[1]} channels"
+                f"{self.mode} expects raw view-major MEM channels in groups of 3, got {raw_channels} raw channels"
             )
         y = x.clone()
-        y[:, 2::3, :, :] = y[:, 2::3, :, :] / self.semantic_max_value
+        y[:, 2:raw_channels:3, :, :] = y[:, 2:raw_channels:3, :, :] / self.semantic_max_value
         return y
 
 
@@ -203,6 +218,7 @@ class MemKnownNodeTokenExtractor(nn.Module):
         hidden_dim: int = 256,
         num_object_classes: int = 14,
         pooler_resolution: int = 3,
+        use_obb_features: bool = False,
     ) -> None:
         super().__init__()
         if pooler_resolution <= 0:
@@ -211,11 +227,13 @@ class MemKnownNodeTokenExtractor(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.num_object_classes = int(num_object_classes)
         self.pooler_resolution = int(pooler_resolution)
+        self.use_obb_features = bool(use_obb_features)
         pooled_dim = self.feature_dim * self.pooler_resolution * self.pooler_resolution
         self.pool_proj = nn.Linear(pooled_dim, self.hidden_dim)
         self.class_embedding = nn.Embedding(self.num_object_classes, self.hidden_dim)
+        geometry_in_dim = 6 if self.use_obb_features else 4
         self.box_geometry_mlp = nn.Sequential(
-            nn.Linear(4, self.hidden_dim),
+            nn.Linear(geometry_in_dim, self.hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
@@ -266,7 +284,24 @@ class MemKnownNodeTokenExtractor(nn.Module):
             )
 
         class_tokens = self.class_embedding(classes)
-        geometry_tokens = self.box_geometry_mlp(self._normalized_box_geometry(boxes, instances.image_size))
+        normalized_geometry = self._normalized_box_geometry(boxes, instances.image_size)
+        if self.use_obb_features:
+            if not instances.has("gt_obb_cxcywht"):
+                raise ValueError(
+                    "use_obb_features=True requires instances.gt_obb_cxcywht (see MemObservedGtMapper MEM_BOX_MODE='obb_from_mask')"
+                )
+            obb = instances.gt_obb_cxcywht.to(device=normalized_geometry.device, dtype=normalized_geometry.dtype)
+            if obb.shape[0] != normalized_geometry.shape[0] or obb.shape[1] != 5:
+                raise ValueError(
+                    f"gt_obb_cxcywht must have shape [N,5] matching gt_boxes; got {tuple(obb.shape)}"
+                )
+            theta = obb[:, 4]
+            sin2t = torch.sin(2.0 * theta)
+            cos2t = torch.cos(2.0 * theta)
+            geometry_input = torch.cat([normalized_geometry, sin2t.unsqueeze(1), cos2t.unsqueeze(1)], dim=1)
+        else:
+            geometry_input = normalized_geometry
+        geometry_tokens = self.box_geometry_mlp(geometry_input)
         if zero_map_node_features:
             pooled_tokens = torch.zeros_like(class_tokens)
         else:
@@ -339,6 +374,9 @@ def build_mem_pair_geometry_features(instances: Instances, feature_names: Sequen
     directed pair source ``i`` -> target ``j`` using normalized box geometry in
     image coordinates, where lower y values are interpreted as closer to shelf
     access/front.
+
+    When OBB-aware features (relative_theta_sin/cos, obb_aspect_ratio_min_over_max)
+    are requested, ``instances.gt_obb_cxcywht`` must be populated by the mapper.
     """
 
     names = _normalise_pair_geometry_feature_names(feature_names)
@@ -355,6 +393,19 @@ def build_mem_pair_geometry_features(instances: Instances, feature_names: Sequen
     num_nodes = int(boxes.shape[0])
     if num_nodes == 0:
         return boxes.new_zeros((0, 0, len(names)))
+
+    obb_requested = any(name in OBB_PAIR_GEOMETRY_FEATURES for name in names)
+    obb_tensor: Optional[torch.Tensor] = None
+    if obb_requested:
+        if not instances.has("gt_obb_cxcywht"):
+            raise ValueError(
+                "OBB pair-geometry features require instances.gt_obb_cxcywht (set MEM_BOX_MODE='obb_from_mask')"
+            )
+        obb_tensor = instances.gt_obb_cxcywht.to(dtype=torch.float32)
+        if obb_tensor.shape != (num_nodes, 5):
+            raise ValueError(
+                f"instances.gt_obb_cxcywht must have shape [N,5]; got {tuple(obb_tensor.shape)}"
+            )
 
     eps = torch.finfo(boxes.dtype).eps
     x1, y1, x2, y2 = boxes.unbind(dim=1)
@@ -404,6 +455,22 @@ def build_mem_pair_geometry_features(instances: Instances, feature_names: Sequen
         "front_x_overlap_union": front_x_overlap_union,
         "front_x_overlap": front_x_overlap_union,
     }
+
+    if obb_tensor is not None:
+        theta = obb_tensor[:, 4]
+        delta_theta = theta[:, None] - theta[None, :]
+        feature_values["relative_theta_sin"] = torch.sin(2.0 * delta_theta)
+        feature_values["relative_theta_cos"] = torch.cos(2.0 * delta_theta)
+        obb_w = obb_tensor[:, 2]
+        obb_h = obb_tensor[:, 3]
+        obb_long = torch.maximum(obb_w, obb_h)
+        obb_short = torch.minimum(obb_w, obb_h)
+        aspect = obb_short / obb_long.clamp(min=eps)
+        feature_values["obb_aspect_ratio_min_over_max"] = (
+            torch.minimum(aspect[:, None], aspect[None, :])
+            / torch.maximum(aspect[:, None], aspect[None, :]).clamp(min=eps)
+        )
+
     return torch.stack([feature_values[name] for name in names], dim=-1)
 
 
@@ -423,6 +490,7 @@ class MemGraphDenseKnownNodes(nn.Module):
         self.visible_blocks_hidden_aux_enabled = bool(mem_cfg.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED)
         self.visible_blocks_hidden_aux_loss_weight = float(mem_cfg.VISIBLE_BLOCKS_HIDDEN_AUX_LOSS_WEIGHT)
         self.visible_blocks_hidden_aux_pos_weight = float(mem_cfg.VISIBLE_BLOCKS_HIDDEN_AUX_POS_WEIGHT)
+        self.use_obb_features = bool(getattr(mem_cfg, "USE_OBB_FEATURES", False))
         self.pair_geometry_feature_names: Tuple[str, ...] = (
             _normalise_pair_geometry_feature_names(mem_cfg.PAIR_GEOMETRY_FEATURES)
             if self.pair_geometry_enabled
@@ -438,6 +506,7 @@ class MemGraphDenseKnownNodes(nn.Module):
             hidden_dim=int(mem_cfg.HIDDEN_DIM),
             num_object_classes=int(mem_cfg.NUM_OBJECT_CLASSES),
             pooler_resolution=int(mem_cfg.POOLER_RESOLUTION),
+            use_obb_features=self.use_obb_features,
         )
         graph_cfg = cfg.MODEL.GRAPH_HEAD
         if graph_cfg.NAME != "GraphTransformerDense":
@@ -527,6 +596,7 @@ class MemGraphDenseKnownNodes(nn.Module):
             "node_order_instance_ids": metadata.get("node_order_instance_ids", []),
             "pair_geometry_feature_names": list(self.pair_geometry_feature_names),
             "zero_map_node_features": self.zero_map_node_features,
+            "use_obb_features": self.use_obb_features,
         }
         if self.visible_blocks_hidden_aux_enabled and visible_blocks_hidden_logits is not None:
             output["visible_blocks_hidden_logits"] = visible_blocks_hidden_logits

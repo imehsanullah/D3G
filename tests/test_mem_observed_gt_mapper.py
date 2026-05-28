@@ -10,7 +10,11 @@ from data import get_mapper
 from detectron2.config import get_cfg
 
 from data.mem_observed_gt_dataset import load_mem_observed_gt_records
-from data.mem_observed_gt_mapper import MemObservedGtMapper, materialize_mem_observed_tensor
+from data.mem_observed_gt_mapper import (
+    MemObservedGtMapper,
+    materialize_mem_cnabu_mean_tensor,
+    materialize_mem_observed_tensor,
+)
 from utils.configs import add_dep_graph_config, add_detr_config
 
 
@@ -83,6 +87,33 @@ class MemObservedGtMapperTest(unittest.TestCase):
                 [1, 0, 0],
             ],
         }
+
+    def _write_cnabu_npz(
+        self,
+        cnabu_root: Path,
+        sample_rel: Path,
+        *,
+        selected_view_indices: list[int],
+        crop_rows: tuple[int, int],
+        crop_width: int,
+    ) -> Path:
+        cnabu_path = cnabu_root / "samples" / sample_rel / "cnabu_hms.npz"
+        cnabu_path.parent.mkdir(parents=True, exist_ok=True)
+        crop_height = int(crop_rows[1] - crop_rows[0])
+        occupancy_alpha = np.full((2, crop_height, crop_width), 0.8, dtype=np.float32)
+        occupancy_beta = np.full((2, crop_height, crop_width), 0.2, dtype=np.float32)
+        semantic_concentration = np.ones((15, crop_height, crop_width), dtype=np.float32)
+        semantic_concentration[4] = 10.0
+        np.savez(
+            cnabu_path,
+            occupancy_alpha=occupancy_alpha,
+            occupancy_beta=occupancy_beta,
+            semantic_concentration=semantic_concentration,
+            selected_view_indices=np.asarray(selected_view_indices, dtype=np.int16),
+            crop_rows=np.asarray(crop_rows, dtype=np.int16),
+            metadata_json=np.asarray(json.dumps({"source": "synthetic_cnabu"})),
+        )
+        return cnabu_path
 
     def test_materialize_mem_observed_tensor_uses_view_major_channel_order(self):
         hms = np.zeros((3, 2, 2, 2), dtype=np.float32)
@@ -259,6 +290,93 @@ class MemObservedGtMapperTest(unittest.TestCase):
             self.assertEqual(metadata["visible_blocks_hidden_target"], [1, 1])
             self.assertEqual(metadata["num_visible_blocks_hidden_positive"], 2)
 
+    def test_materialize_cnabu_mean_pads_crop_into_raw_coordinate_frame(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cnabu_path = self._write_cnabu_npz(
+                Path(tmpdir),
+                Path("synthetic_group/option2b_visible_nodes/pre_action"),
+                selected_view_indices=[0, 2],
+                crop_rows=(1, 3),
+                crop_width=5,
+            )
+
+            image, layout, metadata = materialize_mem_cnabu_mean_tensor(
+                cnabu_path,
+                selected_view_indices=[0, 2],
+                raw_height=4,
+                raw_width=5,
+            )
+
+            self.assertEqual(image.shape, (16, 4, 5))
+            self.assertEqual(image.dtype, np.float32)
+            self.assertTrue(np.allclose(image[0, 0], 0.5))
+            self.assertTrue(np.allclose(image[1:, 0], 1.0 / 15.0))
+            self.assertTrue(np.allclose(image[0, 1:3], 0.8))
+            self.assertGreater(float(image[5, 1, 0]), float(image[1, 1, 0]))
+            self.assertEqual(layout[0]["source_channel"], "occupancy_mean_zmax")
+            self.assertEqual(metadata["cnabu_crop_rows"], [1, 3])
+
+    def test_option2b_mapper_uses_cnabu_mean_features_without_changing_observed_nodes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pre_action_dir = root / "synthetic_group" / "option2b_visible_nodes" / "pre_action"
+            hms, semantic_hms, _ = self._write_option2b_hms_npz(pre_action_dir)
+            cnabu_root = root / "cnabu"
+            self._write_cnabu_npz(
+                cnabu_root,
+                Path("synthetic_group/option2b_visible_nodes/pre_action"),
+                selected_view_indices=[0, 2],
+                crop_rows=(1, 3),
+                crop_width=5,
+            )
+            record = self._option2b_source_record(pre_action_dir)
+
+            mapper = MemObservedGtMapper(
+                data_root=str(root),
+                is_train=False,
+                graph_gt_type="dense",
+                expected_height=4,
+                expected_width=5,
+                semantic_class_max=14,
+                mem_node_source="observed_instance_maps",
+                mem_graph_target_scope="observed_induced",
+                mem_map_feature_source="cnabu_mean",
+                cnabu_derived_root=str(cnabu_root),
+            )
+            out = mapper(record)
+
+            self.assertEqual(out["image"].shape, torch.Size([16, 4, 5]))
+            self.assertEqual(out["instances"].image_size, (4, 5))
+            self.assertTrue(torch.equal(out["instances"].gt_classes, torch.tensor([4, 7])))
+            self.assertEqual(out["mem_metadata"]["mem_map_feature_source"], "cnabu_mean")
+            self.assertEqual(out["mem_metadata"]["cnabu_crop_rows"], [1, 3])
+            self.assertEqual(out["mem_metadata"]["node_order_instance_ids"], [11, 22])
+            self.assertTrue(torch.equal(out["graph_gt"], torch.tensor([[0, 1], [0, 0]], dtype=torch.long)))
+
+            concat_mapper = MemObservedGtMapper(
+                data_root=str(root),
+                is_train=False,
+                graph_gt_type="dense",
+                expected_height=4,
+                expected_width=5,
+                semantic_class_max=14,
+                mem_node_source="observed_instance_maps",
+                mem_graph_target_scope="observed_induced",
+                mem_map_feature_source="raw_plus_cnabu_mean",
+                cnabu_derived_root=str(cnabu_root),
+            )
+            concat_out = concat_mapper(record)
+
+            self.assertEqual(concat_out["image"].shape, torch.Size([22, 4, 5]))
+            self.assertTrue(torch.equal(concat_out["image"][0], torch.from_numpy(hms[0, :, :, 0])))
+            self.assertTrue(torch.equal(concat_out["image"][2], torch.from_numpy(semantic_hms[0])))
+            self.assertTrue(torch.allclose(concat_out["image"][6, 0], torch.full((5,), 0.5)))
+            self.assertTrue(torch.allclose(concat_out["image"][6, 1:3], torch.full((2, 5), 0.8)))
+            self.assertEqual(concat_out["mem_metadata"]["mem_map_feature_source"], "raw_plus_cnabu_mean")
+            self.assertEqual(concat_out["mem_metadata"]["channel_layout"][6]["source_field"], "cnabu_hms")
+            self.assertEqual(concat_out["mem_metadata"]["node_order_instance_ids"], [11, 22])
+            self.assertTrue(torch.equal(concat_out["graph_gt"], torch.tensor([[0, 1], [0, 0]], dtype=torch.long)))
+
     def test_option2b_config_file_sets_node_source_and_target_scope(self):
         cfg = get_cfg()
         add_dep_graph_config(cfg)
@@ -268,6 +386,44 @@ class MemObservedGtMapperTest(unittest.TestCase):
         self.assertEqual(cfg.INPUT.MEM_NODE_SOURCE, "observed_instance_maps")
         self.assertEqual(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
         self.assertEqual(cfg.MODEL.META_ARCHITECTURE, "MemGraphDenseKnownNodes")
+
+    def test_option2b_cnabu_mean_config_sets_feature_source(self):
+        cfg = get_cfg()
+        add_dep_graph_config(cfg)
+        add_detr_config(cfg)
+        cfg.merge_from_file(
+            str(
+                Path(__file__).resolve().parents[1]
+                / "configs"
+                / "mem"
+                / "option2b_observed_visible_nodes_pair_geometry_cnabu_mean.yaml"
+            )
+        )
+
+        self.assertEqual(cfg.INPUT.MEM_NODE_SOURCE, "observed_instance_maps")
+        self.assertEqual(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
+        self.assertEqual(cfg.INPUT.MEM_MAP_FEATURE_SOURCE, "cnabu_mean")
+        self.assertEqual(cfg.MODEL.MEM_GRAPH.IN_CHANNELS, 16)
+        self.assertEqual(cfg.MODEL.MEM_GRAPH.INPUT_NORMALIZATION, "none")
+
+    def test_option2b_raw_plus_cnabu_mean_config_sets_feature_source(self):
+        cfg = get_cfg()
+        add_dep_graph_config(cfg)
+        add_detr_config(cfg)
+        cfg.merge_from_file(
+            str(
+                Path(__file__).resolve().parents[1]
+                / "configs"
+                / "mem"
+                / "option2b_observed_visible_nodes_pair_geometry_raw_plus_cnabu_mean.yaml"
+            )
+        )
+
+        self.assertEqual(cfg.INPUT.MEM_NODE_SOURCE, "observed_instance_maps")
+        self.assertEqual(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE, "observed_induced")
+        self.assertEqual(cfg.INPUT.MEM_MAP_FEATURE_SOURCE, "raw_plus_cnabu_mean")
+        self.assertEqual(cfg.MODEL.MEM_GRAPH.IN_CHANNELS, 46)
+        self.assertEqual(cfg.MODEL.MEM_GRAPH.INPUT_NORMALIZATION, "raw_plus_cnabu_mean_v0")
 
     def test_option2a_config_file_keeps_gt_all_known_node_contract(self):
         cfg = get_cfg()

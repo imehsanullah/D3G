@@ -1,0 +1,16 @@
+_BASE_: 'option2b_observed_visible_nodes_pair_geometry.yaml'
+
+DATASETS:
+  TRAIN: ("mem_option2b_observed_visible_nodes_pair_geometry_cnabu_mean",)
+  TEST: ("mem_option2b_observed_visible_nodes_pair_geometry_cnabu_mean",)
+  MEM_CNABU_DERIVED_ROOT: ""
+
+INPUT:
+  MEM_MAP_FEATURE_SOURCE: "cnabu_mean"
+  MEM_CNABU_PAD_MODE: "prior"
+
+MODEL:
+  MEM_GRAPH:
+    IN_CHANNELS: 16
+    INPUT_NORMALIZATION: "none"
+    SEMANTIC_MAX_VALUE: 1.0

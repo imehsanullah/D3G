@@ -8,6 +8,7 @@ nodes (Option 2B).  It does not run a model forward, training, export, HDF5
 packing, checkpoint loading, or checkpoint writing.
 """
 
+import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -25,8 +26,14 @@ DEFAULT_SEMANTIC_CLASS_MIN = 0
 DEFAULT_SEMANTIC_CLASS_MAX = 14
 DEFAULT_MEM_NODE_SOURCE = "gt"
 DEFAULT_MEM_GRAPH_TARGET_SCOPE = "gt_all"
+DEFAULT_MEM_BOX_MODE = "aabb"
+DEFAULT_MEM_MAP_FEATURE_SOURCE = "raw_observed"
+DEFAULT_MEM_CNABU_PAD_MODE = "prior"
 SUPPORTED_MEM_NODE_SOURCES = ("gt", "observed_instance_maps")
 SUPPORTED_MEM_GRAPH_TARGET_SCOPES = ("gt_all", "observed_induced")
+SUPPORTED_MEM_BOX_MODES = ("aabb", "obb_from_mask")
+SUPPORTED_MEM_MAP_FEATURE_SOURCES = ("raw_observed", "cnabu_mean", "raw_plus_cnabu_mean")
+SUPPORTED_MEM_CNABU_PAD_MODES = ("prior", "zero")
 
 
 def _coerce_int_list(values: Iterable[Any]) -> List[int]:
@@ -123,6 +130,180 @@ def materialize_mem_observed_tensor(
     return np.stack(channels, axis=0).astype(np.float32, copy=False), layout
 
 
+def _metadata_json_to_dict(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, np.ndarray):
+        if value.shape == ():
+            value = value.item()
+        else:
+            return {}
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str) and value:
+        try:
+            loaded = json.loads(value)
+        except Exception:
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+    return {}
+
+
+def materialize_mem_cnabu_mean_tensor(
+    cnabu_hms_path: Path,
+    *,
+    selected_view_indices: Sequence[int],
+    raw_height: int,
+    raw_width: int,
+    semantic_class_count: int = 15,
+    pad_mode: str = DEFAULT_MEM_CNABU_PAD_MODE,
+) -> Tuple[np.ndarray, List[Dict[str, Any]], Dict[str, Any]]:
+    """Materialize CNABU mean features into the MEM raw coordinate frame.
+
+    The CNABU observation model operates on crop rows 10:130 and emits
+    [120,200] belief maps. D3G Option 2B node boxes and instance masks remain in
+    the raw [140,200] frame, so this mapper pads the CNABU crop back into the raw
+    frame before ROI pooling.
+    """
+
+    cnabu_path = Path(cnabu_hms_path).expanduser()
+    if not cnabu_path.is_file():
+        raise FileNotFoundError("missing CNABU derived file: {}".format(cnabu_path))
+    pad_mode = str(pad_mode).strip()
+    if pad_mode not in SUPPORTED_MEM_CNABU_PAD_MODES:
+        raise ValueError(
+            "MEM_CNABU_PAD_MODE must be one of {}, got {!r}".format(
+                SUPPORTED_MEM_CNABU_PAD_MODES,
+                pad_mode,
+            )
+        )
+
+    selected = _coerce_int_list(selected_view_indices)
+    with np.load(cnabu_path, allow_pickle=False) as data:
+        if "selected_view_indices" not in data.files:
+            raise KeyError("missing selected_view_indices in {}".format(cnabu_path))
+        exported_selected = _coerce_int_list(np.asarray(data["selected_view_indices"]).tolist())
+        if exported_selected != selected:
+            raise ValueError(
+                "CNABU selected_view_indices {} do not match mapper selection {} for {}".format(
+                    exported_selected,
+                    selected,
+                    cnabu_path,
+                )
+            )
+        if "crop_rows" not in data.files:
+            raise KeyError("missing crop_rows in {}".format(cnabu_path))
+        crop_rows = _coerce_int_list(np.asarray(data["crop_rows"]).tolist())
+        if len(crop_rows) != 2:
+            raise ValueError("CNABU crop_rows must have shape [2], got {}".format(crop_rows))
+
+        if "occupancy_mean" in data.files:
+            occupancy_mean = np.asarray(data["occupancy_mean"], dtype=np.float32)
+        else:
+            if "occupancy_alpha" not in data.files or "occupancy_beta" not in data.files:
+                raise KeyError("CNABU file must contain occupancy_mean or occupancy_alpha+occupancy_beta")
+            occupancy_alpha = np.asarray(data["occupancy_alpha"], dtype=np.float32)
+            occupancy_beta = np.asarray(data["occupancy_beta"], dtype=np.float32)
+            occupancy_mean = occupancy_alpha / np.maximum(occupancy_alpha + occupancy_beta, 1e-8)
+
+        if "semantic_mean" in data.files:
+            semantic_mean = np.asarray(data["semantic_mean"], dtype=np.float32)
+        else:
+            if "semantic_concentration" not in data.files:
+                raise KeyError("CNABU file must contain semantic_mean or semantic_concentration")
+            semantic_concentration = np.asarray(data["semantic_concentration"], dtype=np.float32)
+            semantic_sum = semantic_concentration.sum(axis=0, keepdims=True)
+            semantic_mean = semantic_concentration / np.maximum(semantic_sum, 1e-8)
+
+        metadata_json = _metadata_json_to_dict(data["metadata_json"]) if "metadata_json" in data.files else {}
+
+    if occupancy_mean.ndim != 3:
+        raise ValueError("CNABU occupancy_mean must have shape [Z,H,W], got {}".format(occupancy_mean.shape))
+    if semantic_mean.ndim != 3:
+        raise ValueError("CNABU semantic_mean must have shape [K,H,W], got {}".format(semantic_mean.shape))
+    if int(semantic_mean.shape[0]) != int(semantic_class_count):
+        raise ValueError(
+            "CNABU semantic_mean class count {} must match {}".format(
+                semantic_mean.shape[0],
+                semantic_class_count,
+            )
+        )
+    if occupancy_mean.shape[1:] != semantic_mean.shape[1:]:
+        raise ValueError(
+            "CNABU occupancy spatial shape {} must match semantic shape {}".format(
+                occupancy_mean.shape[1:],
+                semantic_mean.shape[1:],
+            )
+        )
+
+    row_start, row_stop = int(crop_rows[0]), int(crop_rows[1])
+    crop_height, crop_width = [int(dim) for dim in occupancy_mean.shape[1:]]
+    raw_height = int(raw_height)
+    raw_width = int(raw_width)
+    if crop_width != raw_width:
+        raise ValueError("CNABU crop width {} does not match raw width {}".format(crop_width, raw_width))
+    if row_start < 0 or row_stop > raw_height or row_stop <= row_start:
+        raise ValueError("invalid CNABU crop_rows {} for raw height {}".format(crop_rows, raw_height))
+    if row_stop - row_start != crop_height:
+        raise ValueError(
+            "CNABU crop height {} does not match crop_rows {}".format(
+                crop_height,
+                crop_rows,
+            )
+        )
+
+    occupancy_projection = occupancy_mean.max(axis=0, keepdims=True).astype(np.float32, copy=False)
+    crop_features = np.concatenate(
+        [occupancy_projection, semantic_mean.astype(np.float32, copy=False)],
+        axis=0,
+    )
+    if pad_mode == "prior":
+        image = np.empty((1 + semantic_class_count, raw_height, raw_width), dtype=np.float32)
+        image[0, :, :] = 0.5
+        image[1:, :, :] = 1.0 / float(semantic_class_count)
+    else:
+        image = np.zeros((1 + semantic_class_count, raw_height, raw_width), dtype=np.float32)
+    image[:, row_start:row_stop, :] = crop_features
+
+    layout: List[Dict[str, Any]] = [
+        {
+            "channel_index": 0,
+            "source_field": "cnabu_hms",
+            "source_channel": "occupancy_mean_zmax",
+            "projection": "max_over_z",
+        }
+    ]
+    for class_index in range(semantic_class_count):
+        layout.append(
+            {
+                "channel_index": int(class_index + 1),
+                "source_field": "cnabu_hms",
+                "source_channel": "semantic_mean",
+                "semantic_class_index": int(class_index),
+            }
+        )
+
+    metadata = {
+        "cnabu_hms_path": str(cnabu_path),
+        "cnabu_selected_view_indices": exported_selected,
+        "cnabu_crop_rows": [row_start, row_stop],
+        "cnabu_crop_shape_hw": [crop_height, crop_width],
+        "cnabu_pad_mode": pad_mode,
+        "cnabu_projection": "occupancy_mean_max_over_z_plus_semantic_mean",
+        "cnabu_metadata": metadata_json,
+    }
+    return image, layout, metadata
+
+
+def _offset_channel_layout(layout: Sequence[Dict[str, Any]], offset: int) -> List[Dict[str, Any]]:
+    shifted: List[Dict[str, Any]] = []
+    for item in layout:
+        updated = dict(item)
+        updated["channel_index"] = int(updated["channel_index"]) + int(offset)
+        shifted.append(updated)
+    return shifted
+
+
 def _resolve_sample_dir(sample_dir: str, data_root: str) -> Path:
     if not sample_dir:
         raise ValueError("MEM mapper record must include sample_dir or pre_action_dir")
@@ -183,6 +364,35 @@ def _boxes_tensor(boxes_xyxy_abs: Any, num_nodes: int, height: int, width: int) 
     return torch.as_tensor(boxes, dtype=torch.float32)
 
 
+def _obb_tensor(obb_cxcywht_abs: Any, num_nodes: int) -> torch.Tensor:
+    obb = np.asarray(obb_cxcywht_abs, dtype=np.float32)
+    if obb.size == 0 and num_nodes == 0:
+        obb = np.zeros((0, 5), dtype=np.float32)
+    if obb.shape != (num_nodes, 5):
+        raise ValueError("obb_cxcywht_abs must have shape ({}, 5), got {}".format(num_nodes, obb.shape))
+    for index, (_, _, w, h, _) in enumerate(obb.tolist()):
+        if w < 0 or h < 0:
+            raise ValueError("obb_cxcywht_abs[{}] must have non-negative w/h".format(index))
+    return torch.as_tensor(obb, dtype=torch.float32)
+
+
+def _obb_cxcywht_from_xyxy(boxes_xyxy: torch.Tensor) -> torch.Tensor:
+    """Lift axis-aligned XYXY boxes to OBB tensors with theta=0 (degenerate OBB).
+
+    Used when MEM_BOX_MODE='aabb' but the model still expects an OBB tensor slot,
+    so the OBB code path becomes a no-op identity over AABB inputs.
+    """
+    if boxes_xyxy.numel() == 0:
+        return boxes_xyxy.new_zeros((0, 5))
+    x1, y1, x2, y2 = boxes_xyxy.unbind(dim=-1)
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    w = (x2 - x1).clamp(min=0.0)
+    h = (y2 - y1).clamp(min=0.0)
+    theta = boxes_xyxy.new_zeros(cx.shape)
+    return torch.stack([cx, cy, w, h, theta], dim=-1)
+
+
 def _validate_semantic_hms(
     semantic_hms: np.ndarray,
     selected_view_indices: Sequence[int],
@@ -229,6 +439,82 @@ def _normalise_mem_graph_target_scope(value: str) -> str:
     return target_scope
 
 
+def _normalise_mem_box_mode(value: str) -> str:
+    box_mode = str(value).strip()
+    if box_mode not in SUPPORTED_MEM_BOX_MODES:
+        raise ValueError(
+            "MEM_BOX_MODE must be one of {}, got {!r}".format(SUPPORTED_MEM_BOX_MODES, box_mode)
+        )
+    return box_mode
+
+
+def _normalise_mem_map_feature_source(value: str) -> str:
+    feature_source = str(value).strip()
+    if feature_source not in SUPPORTED_MEM_MAP_FEATURE_SOURCES:
+        raise ValueError(
+            "MEM_MAP_FEATURE_SOURCE must be one of {}, got {!r}".format(
+                SUPPORTED_MEM_MAP_FEATURE_SOURCES,
+                feature_source,
+            )
+        )
+    return feature_source
+
+
+def _normalise_mem_cnabu_pad_mode(value: str) -> str:
+    pad_mode = str(value).strip()
+    if pad_mode not in SUPPORTED_MEM_CNABU_PAD_MODES:
+        raise ValueError(
+            "MEM_CNABU_PAD_MODE must be one of {}, got {!r}".format(
+                SUPPORTED_MEM_CNABU_PAD_MODES,
+                pad_mode,
+            )
+        )
+    return pad_mode
+
+
+def _path_relative_to_optional_root(path: Path, root: Path) -> Optional[Path]:
+    try:
+        return path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None
+
+
+def _resolve_cnabu_hms_path(record: Dict[str, Any], pre_action_dir: Path, data_root: str, cnabu_derived_root: str) -> Path:
+    explicit_path = record.get("cnabu_hms_path")
+    if explicit_path:
+        path = Path(str(explicit_path)).expanduser()
+        if not path.is_absolute():
+            path = Path(cnabu_derived_root).expanduser() / path
+        return path
+
+    if not cnabu_derived_root:
+        raise ValueError(
+            "MEM_MAP_FEATURE_SOURCE using CNABU features requires DATASETS.MEM_CNABU_DERIVED_ROOT"
+        )
+    derived_root = Path(cnabu_derived_root).expanduser()
+    data_root_path = Path(data_root).expanduser()
+    rel = _path_relative_to_optional_root(pre_action_dir, data_root_path)
+    if rel is None:
+        sample_id = str(record.get("sample_id") or record.get("id") or record.get("image_id") or "").strip()
+        if sample_id:
+            rel = Path(sample_id) / "pre_action"
+        else:
+            raise ValueError(
+                "could not derive CNABU sample-relative path for {}; set record['cnabu_hms_path']".format(
+                    pre_action_dir,
+                )
+            )
+
+    candidates = [
+        derived_root / "samples" / rel / "cnabu_hms.npz",
+        derived_root / rel / "cnabu_hms.npz",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
 def _validate_mem_node_target_pair(mem_node_source: str, mem_graph_target_scope: str) -> None:
     if mem_node_source == "gt" and mem_graph_target_scope == "gt_all":
         return
@@ -247,6 +533,31 @@ def _bbox_xyxy_abs_from_mask(mask: np.ndarray) -> List[int]:
     if ys.size == 0 or xs.size == 0:
         raise ValueError("cannot compute bbox for an empty observed instance mask")
     return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+
+
+def _obb_cxcywht_from_mask(mask: np.ndarray) -> List[float]:
+    """Compute oriented bbox (cx, cy, w, h, theta_radians) from a binary mask.
+
+    Theta is the rotation of the long axis (w >= h) from the x-axis, wrapped
+    into [-pi/2, pi/2). Encode as (sin(2*theta), cos(2*theta)) to respect the
+    180-degree rotational symmetry of a rectangle.
+    """
+    import cv2  # local import: cv2 is in the d3g env but lazy keeps mapper import light
+
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0 or xs.size == 0:
+        raise ValueError("cannot compute OBB for an empty observed instance mask")
+    points = np.stack([xs, ys], axis=1).astype(np.int32)
+    (cx, cy), (w, h), angle_deg = cv2.minAreaRect(points)
+    w = float(w)
+    h = float(h)
+    angle_deg = float(angle_deg)
+    if w < h:
+        w, h = h, w
+        angle_deg = angle_deg + 90.0
+    angle_deg = ((angle_deg + 90.0) % 180.0) - 90.0
+    theta = float(np.deg2rad(angle_deg))
+    return [float(cx), float(cy), w, h, theta]
 
 
 def _majority_observed_semantic_class(
@@ -331,6 +642,7 @@ def build_observed_induced_mem_graph_contract(
     aligned_ids: List[int] = []
     aligned_source_gt_indices: List[int] = []
     bbox_xyxy_abs: List[List[int]] = []
+    obb_cxcywht_abs: List[List[float]] = []
     bbox_categories: List[int] = []
     observed_node_records: List[Dict[str, Any]] = []
     unmatched_observed_ids: List[int] = []
@@ -355,9 +667,11 @@ def build_observed_induced_mem_graph_contract(
             invalid_class_observed_ids.append(instance_id)
             continue
         xyxy = _bbox_xyxy_abs_from_mask(union_mask)
+        obb = _obb_cxcywht_from_mask(union_mask)
         aligned_ids.append(instance_id)
         aligned_source_gt_indices.append(int(gt_index_by_instance_id[instance_id]))
         bbox_xyxy_abs.append(xyxy)
+        obb_cxcywht_abs.append(obb)
         bbox_categories.append(int(semantic_class))
         observed_node_records.append(
             {
@@ -366,6 +680,7 @@ def build_observed_induced_mem_graph_contract(
                 "aligned_gt_instance_id": int(instance_id),
                 "source_gt_index": int(gt_index_by_instance_id[instance_id]),
                 "bbox_xyxy_abs": xyxy,
+                "obb_cxcywht_abs": obb,
                 "semantic_class_id": int(semantic_class),
                 "observed_visible_pixels": observed_pixels,
                 **class_metadata,
@@ -398,6 +713,7 @@ def build_observed_induced_mem_graph_contract(
     return {
         "node_order_instance_ids": aligned_ids,
         "bbox_xyxy_abs": bbox_xyxy_abs,
+        "obb_cxcywht_abs": obb_cxcywht_abs,
         "bbox_categories": bbox_categories,
         "graph_gt": induced_graph,
         "dense_gt": induced_graph.clone(),
@@ -445,12 +761,20 @@ class MemObservedGtMapper:
         validate_semantic_range: bool = True,
         mem_node_source: str = DEFAULT_MEM_NODE_SOURCE,
         mem_graph_target_scope: str = DEFAULT_MEM_GRAPH_TARGET_SCOPE,
+        mem_box_mode: str = DEFAULT_MEM_BOX_MODE,
+        mem_map_feature_source: str = DEFAULT_MEM_MAP_FEATURE_SOURCE,
+        cnabu_derived_root: str = "",
+        cnabu_pad_mode: str = DEFAULT_MEM_CNABU_PAD_MODE,
     ) -> None:
         if graph_gt_type != "dense":
             raise ValueError("MemObservedGtMapper currently supports only INPUT.GRAPH_GT_TYPE='dense'")
         self.mem_node_source = _normalise_mem_node_source(mem_node_source)
         self.mem_graph_target_scope = _normalise_mem_graph_target_scope(mem_graph_target_scope)
         _validate_mem_node_target_pair(self.mem_node_source, self.mem_graph_target_scope)
+        self.mem_box_mode = _normalise_mem_box_mode(mem_box_mode)
+        self.mem_map_feature_source = _normalise_mem_map_feature_source(mem_map_feature_source)
+        self.cnabu_derived_root = str(cnabu_derived_root or "")
+        self.cnabu_pad_mode = _normalise_mem_cnabu_pad_mode(cnabu_pad_mode)
         self.data_root = data_root
         self.is_train = is_train
         self.graph_gt_type = graph_gt_type
@@ -477,6 +801,10 @@ class MemObservedGtMapper:
             "validate_semantic_range": getattr(cfg.INPUT, "MEM_VALIDATE_SEMANTIC_RANGE", True),
             "mem_node_source": getattr(cfg.INPUT, "MEM_NODE_SOURCE", DEFAULT_MEM_NODE_SOURCE),
             "mem_graph_target_scope": getattr(cfg.INPUT, "MEM_GRAPH_TARGET_SCOPE", DEFAULT_MEM_GRAPH_TARGET_SCOPE),
+            "mem_box_mode": getattr(cfg.INPUT, "MEM_BOX_MODE", DEFAULT_MEM_BOX_MODE),
+            "mem_map_feature_source": getattr(cfg.INPUT, "MEM_MAP_FEATURE_SOURCE", DEFAULT_MEM_MAP_FEATURE_SOURCE),
+            "cnabu_derived_root": getattr(cfg.DATASETS, "MEM_CNABU_DERIVED_ROOT", ""),
+            "cnabu_pad_mode": getattr(cfg.INPUT, "MEM_CNABU_PAD_MODE", DEFAULT_MEM_CNABU_PAD_MODE),
         }
 
     def __call__(self, dataset_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -502,7 +830,43 @@ class MemObservedGtMapper:
             self.semantic_class_max,
             self.validate_semantic_range,
         )
-        image_np, layout = materialize_mem_observed_tensor(hms, semantic_hms, selected_view_indices)
+        cnabu_metadata: Dict[str, Any] = {}
+        if self.mem_map_feature_source == "raw_observed":
+            image_np, layout = materialize_mem_observed_tensor(hms, semantic_hms, selected_view_indices)
+            map_feature_source_file = str(pre_action_dir / "hms.npz")
+        elif self.mem_map_feature_source in ("cnabu_mean", "raw_plus_cnabu_mean"):
+            cnabu_hms_path = _resolve_cnabu_hms_path(
+                record,
+                pre_action_dir,
+                self.data_root,
+                self.cnabu_derived_root,
+            )
+            cnabu_image_np, cnabu_layout, cnabu_metadata = materialize_mem_cnabu_mean_tensor(
+                cnabu_hms_path,
+                selected_view_indices=selected_view_indices,
+                raw_height=int(hms.shape[1]),
+                raw_width=int(hms.shape[2]),
+                semantic_class_count=int(self.semantic_class_max - self.semantic_class_min + 1),
+                pad_mode=self.cnabu_pad_mode,
+            )
+            if self.mem_map_feature_source == "cnabu_mean":
+                image_np = cnabu_image_np
+                layout = cnabu_layout
+                map_feature_source_file = str(cnabu_hms_path)
+            else:
+                raw_image_np, raw_layout = materialize_mem_observed_tensor(hms, semantic_hms, selected_view_indices)
+                if raw_image_np.shape[1:] != cnabu_image_np.shape[1:]:
+                    raise ValueError(
+                        "raw MEM spatial shape {} must match padded CNABU shape {}".format(
+                            raw_image_np.shape[1:],
+                            cnabu_image_np.shape[1:],
+                        )
+                    )
+                image_np = np.concatenate([raw_image_np, cnabu_image_np], axis=0).astype(np.float32, copy=False)
+                layout = raw_layout + _offset_channel_layout(cnabu_layout, raw_image_np.shape[0])
+                map_feature_source_file = "{} + {}".format(pre_action_dir / "hms.npz", cnabu_hms_path)
+        else:
+            raise AssertionError("unhandled MEM map feature source: {}".format(self.mem_map_feature_source))
         if not np.isfinite(image_np).all():
             raise ValueError("materialized MEM image tensor contains NaN or Inf")
 
@@ -517,6 +881,7 @@ class MemObservedGtMapper:
             raise ValueError("record width {} does not match materialized width {}".format(record["width"], width))
 
         observed_induced_metadata: Dict[str, Any] = {}
+        obb_source = "aabb_lifted_zero_theta"
         if self.mem_node_source == "gt":
             classes = torch.as_tensor(_coerce_int_list(record.get("bbox_categories", [])), dtype=torch.long)
             num_nodes = int(classes.numel())
@@ -524,6 +889,7 @@ class MemObservedGtMapper:
             if node_order and len(node_order) != num_nodes:
                 raise ValueError("node_order_instance_ids length must match bbox_categories length")
             boxes = _boxes_tensor(record.get("bbox_xyxy_abs", []), num_nodes, height, width)
+            obb = _obb_cxcywht_from_xyxy(boxes)
 
             graph_gt = _as_graph_tensor(record.get("graph_gt", []), "graph_gt", num_nodes)
             dense_value = record.get("dense_gt")
@@ -548,6 +914,11 @@ class MemObservedGtMapper:
             classes = torch.as_tensor(_coerce_int_list(observed_contract["bbox_categories"]), dtype=torch.long)
             num_nodes = int(classes.numel())
             boxes = _boxes_tensor(observed_contract["bbox_xyxy_abs"], num_nodes, height, width)
+            if self.mem_box_mode == "obb_from_mask":
+                obb = _obb_tensor(observed_contract["obb_cxcywht_abs"], num_nodes)
+                obb_source = "obb_from_observed_instance_mask"
+            else:
+                obb = _obb_cxcywht_from_xyxy(boxes)
             graph_gt = observed_contract["graph_gt"].to(dtype=torch.long)
             dense_gt = observed_contract["dense_gt"].to(dtype=torch.long)
             observed_induced_metadata = dict(observed_contract["metadata"])
@@ -559,6 +930,7 @@ class MemObservedGtMapper:
             gt_boxes=structures.Boxes(boxes),
             gt_classes=classes,
         )
+        instances.set("gt_obb_cxcywht", obb)
         sample_id = record.get("sample_id") or str(pre_action_dir)
 
         output = {
@@ -573,14 +945,20 @@ class MemObservedGtMapper:
                 "schema": "mem_observed_gt_mapper_item_v0",
                 "sample_id": sample_id,
                 "sample_dir": str(pre_action_dir),
-                "source_file": str(pre_action_dir / "hms.npz"),
+                "source_file": map_feature_source_file,
+                "raw_source_file": str(pre_action_dir / "hms.npz"),
+                "map_feature_source_file": map_feature_source_file,
+                "mem_map_feature_source": self.mem_map_feature_source,
                 "selected_view_indices": selected_view_indices,
                 "observed_view_protocol": self.observed_view_protocol,
                 "flattened_input_shape_chw": [channels, height, width],
                 "channel_layout": layout,
+                **cnabu_metadata,
                 "node_order_instance_ids": node_order,
                 "mem_node_source": self.mem_node_source,
                 "mem_graph_target_scope": self.mem_graph_target_scope,
+                "mem_box_mode": self.mem_box_mode,
+                "obb_source": obb_source,
                 **observed_induced_metadata,
                 "edge_type": record.get("edge_type", "blocks_access_to"),
                 "graph_gt_convention": "graph_gt[i, j] = 1 means ordered MEM node i blocks_access_to ordered MEM node j",
@@ -603,6 +981,7 @@ __all__ = [
     "DEFAULT_MEM_NODE_SOURCE",
     "MemObservedGtMapper",
     "build_observed_induced_mem_graph_contract",
+    "materialize_mem_cnabu_mean_tensor",
     "materialize_mem_observed_tensor",
     "select_mem_observed_view_indices",
 ]
