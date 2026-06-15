@@ -278,6 +278,8 @@ def _build_mapper(cfg, *, data_root: str, is_train: bool) -> MemObservedGtMapper
         mem_map_feature_source=cfg.INPUT.MEM_MAP_FEATURE_SOURCE,
         cnabu_derived_root=cfg.DATASETS.MEM_CNABU_DERIVED_ROOT,
         cnabu_pad_mode=cfg.INPUT.MEM_CNABU_PAD_MODE,
+        cnabu_node_masks_filename=cfg.INPUT.MEM_CNABU_NODE_MASKS_FILENAME,
+        cnabu_match_iou_threshold=float(cfg.INPUT.MEM_CNABU_MATCH_IOU_THRESHOLD),
     )
 
 
@@ -295,24 +297,38 @@ def _as_tensor(value: Any, *, dtype: torch.dtype = torch.float32) -> torch.Tenso
     return torch.tensor(value, dtype=dtype)
 
 
-def compute_non_diagonal_mask(target: Any) -> torch.Tensor:
+def compute_non_diagonal_mask(target: Any, supervision_mask: Any = None) -> torch.Tensor:
     target_tensor = _as_tensor(target)
     if target_tensor.dim() != 2 or target_tensor.shape[0] != target_tensor.shape[1]:
         raise ValueError("target graph must be a square [N,N] matrix")
     num_nodes = int(target_tensor.shape[0])
-    return ~torch.eye(num_nodes, dtype=torch.bool)
+    mask = ~torch.eye(num_nodes, dtype=torch.bool)
+    if supervision_mask is not None:
+        supervision_tensor = _as_tensor(supervision_mask, dtype=torch.bool)
+        if supervision_tensor.shape != target_tensor.shape:
+            raise ValueError(
+                "graph supervision mask shape {} must match target shape {}".format(
+                    tuple(supervision_tensor.shape),
+                    tuple(target_tensor.shape),
+                )
+            )
+        mask = mask & supervision_tensor
+    return mask
 
 
-def summarize_edge_targets(target: Any) -> Dict[str, Any]:
+def summarize_edge_targets(target: Any, supervision_mask: Any = None) -> Dict[str, Any]:
     target_tensor = _as_tensor(target)
-    mask = compute_non_diagonal_mask(target_tensor)
+    mask = compute_non_diagonal_mask(target_tensor, supervision_mask)
     selected = target_tensor[mask]
     num_pairs = int(selected.numel())
     num_positive = int(selected.sum().item())
     num_negative = int(num_pairs - num_positive)
+    total_non_diagonal_pairs = int(compute_non_diagonal_mask(target_tensor).sum().item())
     return {
         "num_nodes": int(target_tensor.shape[0]),
         "num_non_diagonal_pairs": num_pairs,
+        "num_total_non_diagonal_pairs": total_non_diagonal_pairs,
+        "uses_graph_loss_mask": bool(supervision_mask is not None),
         "num_positive_directed_edges": num_positive,
         "num_negative_directed_edges": num_negative,
         "positive_edge_base_rate": float(num_positive / num_pairs) if num_pairs else None,
@@ -323,12 +339,17 @@ def aggregate_target_summaries(summaries: Sequence[Mapping[str, Any]]) -> Dict[s
     num_records = len(summaries)
     num_nodes = int(sum(int(summary.get("num_nodes", 0)) for summary in summaries))
     num_pairs = int(sum(int(summary.get("num_non_diagonal_pairs", 0)) for summary in summaries))
+    total_non_diagonal_pairs = int(
+        sum(int(summary.get("num_total_non_diagonal_pairs", summary.get("num_non_diagonal_pairs", 0))) for summary in summaries)
+    )
     num_positive = int(sum(int(summary.get("num_positive_directed_edges", 0)) for summary in summaries))
     num_negative = int(num_pairs - num_positive)
     return {
         "num_records": int(num_records),
         "num_nodes": num_nodes,
         "num_non_diagonal_pairs": num_pairs,
+        "num_total_non_diagonal_pairs": total_non_diagonal_pairs,
+        "uses_graph_loss_mask": bool(any(bool(summary.get("uses_graph_loss_mask", False)) for summary in summaries)),
         "num_positive_directed_edges": num_positive,
         "num_negative_directed_edges": num_negative,
         "positive_edge_base_rate": float(num_positive / num_pairs) if num_pairs else None,
@@ -535,12 +556,12 @@ def compute_mem_graph_score_metrics(
     return result
 
 
-def _extract_scores_labels_from_logits(logits: Any, target: Any) -> Dict[str, List[Any]]:
+def _extract_scores_labels_from_logits(logits: Any, target: Any, supervision_mask: Any = None) -> Dict[str, List[Any]]:
     logits_tensor = _as_tensor(logits)
     target_tensor = _as_tensor(target)
     if logits_tensor.shape != target_tensor.shape:
         raise ValueError("logits and target must have matching shapes")
-    mask = compute_non_diagonal_mask(target_tensor)
+    mask = compute_non_diagonal_mask(target_tensor, supervision_mask)
     scores = torch.sigmoid(logits_tensor[mask]).detach().cpu().tolist()
     labels = target_tensor[mask].long().detach().cpu().tolist()
     return {"scores": [float(score) for score in scores], "labels": [int(label) for label in labels]}
@@ -773,6 +794,44 @@ def _option2b_metadata_from_mapped(mapped: Mapping[str, Any]) -> Dict[str, Any]:
     return {key: _to_jsonable(metadata.get(key, [] if key.endswith("ids") or key.endswith("records") else None)) for key in keys if key in metadata}
 
 
+def _node_source_metadata_from_mapped(mapped: Mapping[str, Any]) -> Dict[str, Any]:
+    metadata = dict(mapped.get("mem_metadata", {}) or {})
+    keys = (
+        "mem_node_source",
+        "mem_graph_target_scope",
+        "observed_visible_instance_ids",
+        "gt_aligned_instance_ids",
+        "hidden_gt_instance_ids",
+        "unmatched_observed_instance_ids",
+        "observed_node_records",
+        "cnabu_node_masks_path",
+        "cnabu_node_source",
+        "cnabu_component_ids",
+        "cnabu_component_scores",
+        "cnabu_node_records",
+        "cnabu_matched_component_ids",
+        "cnabu_unmatched_component_ids",
+        "cnabu_matched_gt_instance_ids",
+        "cnabu_matched_gt_ious",
+        "cnabu_gt_matchable_instance_ids",
+        "cnabu_unmatched_gt_instance_ids",
+        "cnabu_match_iou_threshold",
+        "num_cnabu_components",
+        "num_cnabu_matched_components",
+        "num_cnabu_unmatched_components",
+        "num_cnabu_gt_matchable_instances",
+        "num_cnabu_unmatched_gt_instances",
+        "pseudo_node_false_positive_count",
+        "gt_node_false_negative_count",
+        "cnabu_node_precision_at_match_threshold",
+        "cnabu_node_recall_at_match_threshold",
+        "cnabu_node_f1_at_match_threshold",
+        "cnabu_supervised_pair_count",
+        "target_scope_note",
+    )
+    return {key: _to_jsonable(metadata.get(key)) for key in keys if key in metadata}
+
+
 def _edge_dump_record(
     *,
     source_index: int,
@@ -812,6 +871,7 @@ def build_mem_prediction_dump(
     logits: Any,
     target: Any,
     *,
+    supervision_mask: Any = None,
     split_name: str,
     threshold: float = DEFAULT_PREDICTION_DUMP_THRESHOLD,
     top_k: int = DEFAULT_PREDICTION_DUMP_TOP_K,
@@ -835,6 +895,7 @@ def build_mem_prediction_dump(
     target_matrix = target_tensor.detach().cpu().long()
     predicted_matrix = (probability_matrix >= threshold).long()
     num_nodes = int(target_matrix.shape[0])
+    supervised_mask = compute_non_diagonal_mask(target_matrix, supervision_mask)
     node_fields = _node_fields_from_mapped(mapped, num_nodes=num_nodes)
     node_ids = node_fields["node_ids"]
     node_boxes = node_fields["node_boxes_xyxy_abs"]
@@ -854,7 +915,7 @@ def build_mem_prediction_dump(
     false_negative_edges: List[Dict[str, Any]] = []
     for source_index in range(num_nodes):
         for target_index in range(num_nodes):
-            if source_index == target_index:
+            if source_index == target_index or not bool(supervised_mask[source_index, target_index].item()):
                 continue
             label = int(target_matrix[source_index, target_index].item())
             pred = int(predicted_matrix[source_index, target_index].item())
@@ -910,6 +971,7 @@ def build_mem_prediction_dump(
         "gt_adjacency_matrix": [[int(value) for value in row] for row in target_matrix.tolist()],
         "predicted_probability_matrix": [[float(value) for value in row] for row in probability_matrix.tolist()],
         "predicted_adjacency_matrix_at_threshold": [[int(value) for value in row] for row in predicted_matrix.tolist()],
+        "supervised_pair_mask_matrix": [[bool(value) for value in row] for row in supervised_mask.tolist()],
         "edge_confusion_at_threshold": {
             "true_positive": int(tp),
             "false_positive": int(fp),
@@ -921,6 +983,7 @@ def build_mem_prediction_dump(
         "all_false_positive_count": int(len(false_positive_edges)),
         "all_false_negative_count": int(len(false_negative_edges)),
         "option2b_metadata": _option2b_metadata_from_mapped(mapped),
+        "node_source_metadata": _node_source_metadata_from_mapped(mapped),
         "mem_metadata_summary": {
             "mem_node_source": metadata.get("mem_node_source"),
             "mem_graph_target_scope": metadata.get("mem_graph_target_scope"),
@@ -1009,6 +1072,34 @@ def _option2b_counts(mapped_items: Sequence[Mapping[str, Any]]) -> Dict[str, int
     return counts
 
 
+def _cnabu_component_counts(mapped_items: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    integer_keys = (
+        "num_cnabu_components",
+        "num_cnabu_matched_components",
+        "num_cnabu_unmatched_components",
+        "num_cnabu_gt_matchable_instances",
+        "num_cnabu_unmatched_gt_instances",
+        "pseudo_node_false_positive_count",
+        "gt_node_false_negative_count",
+        "cnabu_supervised_pair_count",
+    )
+    counts = {key: 0 for key in integer_keys}
+    for mapped in mapped_items:
+        metadata = dict(mapped.get("mem_metadata", {}) or {})
+        for key in integer_keys:
+            counts[key] += int(metadata.get(key, 0) or 0)
+    matched = int(counts["num_cnabu_matched_components"])
+    components = int(counts["num_cnabu_components"])
+    gt_instances = int(counts["num_cnabu_gt_matchable_instances"])
+    precision = float(matched / components) if components else 0.0
+    recall = float(matched / gt_instances) if gt_instances else 0.0
+    f1 = float((2.0 * precision * recall) / (precision + recall)) if precision + recall > 0.0 else 0.0
+    counts["cnabu_node_precision_at_match_threshold"] = precision
+    counts["cnabu_node_recall_at_match_threshold"] = recall
+    counts["cnabu_node_f1_at_match_threshold"] = f1
+    return counts
+
+
 def evaluate_mem_graph_model(
     model: MemGraphDenseKnownNodes,
     mapped_items: Sequence[Mapping[str, Any]],
@@ -1037,8 +1128,9 @@ def evaluate_mem_graph_model(
     for mapped in mapped_items:
         output, target = _eval_output_and_target(model, mapped)
         logits = output["graph_logits"].detach().cpu()
-        selected = _extract_scores_labels_from_logits(logits, target)
-        record_target_summary = summarize_edge_targets(target)
+        supervision_mask = mapped.get("graph_loss_mask")
+        selected = _extract_scores_labels_from_logits(logits, target, supervision_mask)
+        record_target_summary = summarize_edge_targets(target, supervision_mask)
         record_metrics = compute_mem_graph_score_metrics(
             selected["scores"], selected["labels"], thresholds=thresholds
         ) if selected["labels"] else {}
@@ -1065,6 +1157,7 @@ def evaluate_mem_graph_model(
                 mapped,
                 logits,
                 target,
+                supervision_mask=supervision_mask,
                 split_name=split_name,
                 threshold=prediction_dump_threshold,
                 top_k=prediction_dump_top_k,
@@ -1121,6 +1214,7 @@ def evaluate_mem_graph_model(
         "edge_count": aggregate["num_positive_directed_edges"],
         "pair_count": aggregate["num_non_diagonal_pairs"],
         "option2b_node_counts": _option2b_counts(mapped_items),
+        "cnabu_component_node_counts": _cnabu_component_counts(mapped_items),
         "visible_blocks_hidden_aux_metrics": _aggregate_visible_blocks_hidden_aux_metrics(
             aux_record_values,
             enabled=aux_enabled,
@@ -1584,7 +1678,10 @@ def run_mem_graph_training(
     finally:
         unregister_mem_graph_datasets(dataset_names)
 
-    train_target_summaries = [summarize_edge_targets(mapped["graph_gt"]) for mapped in mapped_by_split["train"]]
+    train_target_summaries = [
+        summarize_edge_targets(mapped["graph_gt"], mapped.get("graph_loss_mask"))
+        for mapped in mapped_by_split["train"]
+    ]
     train_target_summary = aggregate_target_summaries(train_target_summaries)
     graph_loss_pos_weight = _resolve_graph_loss_pos_weight(
         loss_mode,
@@ -1686,6 +1783,8 @@ def run_mem_graph_training(
         "mem_map_feature_source": str(cfg.INPUT.MEM_MAP_FEATURE_SOURCE),
         "mem_cnabu_derived_root": str(cfg.DATASETS.MEM_CNABU_DERIVED_ROOT),
         "mem_cnabu_pad_mode": str(cfg.INPUT.MEM_CNABU_PAD_MODE),
+        "mem_cnabu_node_masks_filename": str(cfg.INPUT.MEM_CNABU_NODE_MASKS_FILENAME),
+        "mem_cnabu_match_iou_threshold": float(cfg.INPUT.MEM_CNABU_MATCH_IOU_THRESHOLD),
         "mem_input_channels": int(cfg.MODEL.MEM_GRAPH.IN_CHANNELS),
         "mem_input_normalization": str(cfg.MODEL.MEM_GRAPH.INPUT_NORMALIZATION),
         "mem_node_source": str(cfg.INPUT.MEM_NODE_SOURCE),

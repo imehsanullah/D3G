@@ -12,6 +12,7 @@ from detectron2.config import get_cfg
 from data.mem_observed_gt_dataset import load_mem_observed_gt_records
 from data.mem_observed_gt_mapper import (
     MemObservedGtMapper,
+    load_cnabu_component_node_masks,
     materialize_mem_cnabu_mean_tensor,
     materialize_mem_observed_tensor,
 )
@@ -114,6 +115,51 @@ class MemObservedGtMapperTest(unittest.TestCase):
             metadata_json=np.asarray(json.dumps({"source": "synthetic_cnabu"})),
         )
         return cnabu_path
+
+    def _write_option2c_raw_and_gt(self, pre_action_dir: Path) -> None:
+        pre_action_dir.mkdir(parents=True, exist_ok=True)
+        hms = np.zeros((3, 4, 5, 2), dtype=np.float32)
+        semantic_hms = np.zeros((3, 4, 5), dtype=np.float32)
+        np.savez(pre_action_dir / "hms.npz", hms=hms, semantic_hms=semantic_hms)
+
+        gt_instance_maps = np.zeros((4, 5), dtype=np.int32)
+        gt_instance_maps[0:2, 0:2] = 101
+        gt_instance_maps[2:4, 2:5] = 202
+        np.savez(pre_action_dir / "gt_hms.npz", instance_maps=gt_instance_maps)
+
+    def _option2c_source_record(self, pre_action_dir: Path) -> dict:
+        return {
+            "sample_id": "synthetic_group/option2c_cnabu_components",
+            "sample_dir": str(pre_action_dir),
+            "selected_view_indices": [0, 2],
+            "height": 4,
+            "width": 5,
+            "bbox_xyxy_abs": [[0, 0, 2, 2], [2, 2, 5, 4]],
+            "bbox_categories": [4, 7],
+            "node_order_instance_ids": [101, 202],
+            "graph_gt": [[0, 1], [0, 0]],
+        }
+
+    def _write_cnabu_node_masks_npz(self, cnabu_root: Path, sample_rel: Path) -> Path:
+        node_path = cnabu_root / "samples" / sample_rel / "node_masks.npz"
+        node_path.parent.mkdir(parents=True, exist_ok=True)
+        masks = np.zeros((3, 4, 5), dtype=np.uint8)
+        masks[0, 0:2, 0:2] = 1
+        masks[1, 2:4, 2:5] = 1
+        masks[2, 0:1, 4:5] = 1
+        np.savez(
+            node_path,
+            node_masks=masks,
+            node_semantic_labels=np.asarray([4, 7, 4], dtype=np.int16),
+            node_scores=np.asarray([0.9, 0.8, 0.7], dtype=np.float32),
+            bbox_xyxy_abs=np.asarray([[0, 0, 2, 2], [2, 2, 5, 4], [4, 0, 5, 1]], dtype=np.int16),
+            component_ids=np.asarray([10, 20, 30], dtype=np.int32),
+            crop_rows=np.asarray([1, 3], dtype=np.int16),
+            thresholds=np.asarray([0.5, 0.0], dtype=np.float32),
+            node_source=np.asarray("cnabu_3d_components"),
+            metadata_json=np.asarray(json.dumps({"source": "synthetic_components"})),
+        )
+        return node_path
 
     def test_materialize_mem_observed_tensor_uses_view_major_channel_order(self):
         hms = np.zeros((3, 2, 2, 2), dtype=np.float32)
@@ -377,6 +423,102 @@ class MemObservedGtMapperTest(unittest.TestCase):
             self.assertEqual(concat_out["mem_metadata"]["node_order_instance_ids"], [11, 22])
             self.assertTrue(torch.equal(concat_out["graph_gt"], torch.tensor([[0, 1], [0, 0]], dtype=torch.long)))
 
+    def test_cnabu_component_node_masks_loader_validates_shape_and_crop(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            node_path = self._write_cnabu_node_masks_npz(
+                Path(tmpdir),
+                Path("synthetic_group/option2c_cnabu_components/pre_action"),
+            )
+
+            contract = load_cnabu_component_node_masks(
+                node_path,
+                raw_height=4,
+                raw_width=5,
+                semantic_class_max=14,
+            )
+
+            self.assertEqual(contract["node_masks"].shape, (3, 4, 5))
+            self.assertEqual(contract["component_ids"], [10, 20, 30])
+            self.assertEqual(contract["node_semantic_labels"], [4, 7, 4])
+            self.assertEqual(contract["crop_rows"], [1, 3])
+            with self.assertRaisesRegex(ValueError, "spatial shape"):
+                load_cnabu_component_node_masks(
+                    node_path,
+                    raw_height=5,
+                    raw_width=5,
+                    semantic_class_max=14,
+                )
+
+    def test_option2c_mapper_keeps_pseudo_nodes_and_masks_supervision_to_matched_gt_pairs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            sample_rel = Path("synthetic_group/option2c_cnabu_components/pre_action")
+            pre_action_dir = root / sample_rel
+            self._write_option2c_raw_and_gt(pre_action_dir)
+            cnabu_root = root / "cnabu"
+            self._write_cnabu_node_masks_npz(cnabu_root, sample_rel)
+            record = self._option2c_source_record(pre_action_dir)
+
+            mapper = MemObservedGtMapper(
+                data_root=str(root),
+                is_train=False,
+                graph_gt_type="dense",
+                expected_height=4,
+                expected_width=5,
+                semantic_class_max=14,
+                mem_node_source="cnabu_components",
+                mem_graph_target_scope="cnabu_induced",
+                cnabu_derived_root=str(cnabu_root),
+                cnabu_match_iou_threshold=0.5,
+            )
+            out = mapper(record)
+
+            self.assertEqual(out["image"].shape, torch.Size([6, 4, 5]))
+            self.assertEqual(out["instances"].image_size, (4, 5))
+            self.assertTrue(torch.equal(out["instances"].gt_classes, torch.tensor([4, 7, 4])))
+            self.assertTrue(
+                torch.equal(
+                    out["instances"].gt_boxes.tensor,
+                    torch.tensor(
+                        [[0.0, 0.0, 2.0, 2.0], [2.0, 2.0, 5.0, 4.0], [4.0, 0.0, 5.0, 1.0]]
+                    ),
+                )
+            )
+            self.assertTrue(out["instances"].has("gt_masks"))
+            expected_graph = torch.tensor(
+                [
+                    [0, 1, 0],
+                    [0, 0, 0],
+                    [0, 0, 0],
+                ],
+                dtype=torch.long,
+            )
+            expected_mask = torch.tensor(
+                [
+                    [False, True, False],
+                    [True, False, False],
+                    [False, False, False],
+                ],
+                dtype=torch.bool,
+            )
+            self.assertTrue(torch.equal(out["graph_gt"], expected_graph))
+            self.assertTrue(torch.equal(out["dense_gt"], expected_graph))
+            self.assertTrue(torch.equal(out["graph_loss_mask"], expected_mask))
+
+            metadata = out["mem_metadata"]
+            self.assertEqual(metadata["mem_node_source"], "cnabu_components")
+            self.assertEqual(metadata["mem_graph_target_scope"], "cnabu_induced")
+            self.assertEqual(metadata["node_order_instance_ids"], [10, 20, 30])
+            self.assertEqual(metadata["cnabu_matched_gt_instance_ids"], [101, 202, -1])
+            self.assertEqual(metadata["cnabu_unmatched_component_ids"], [30])
+            self.assertEqual(metadata["cnabu_unmatched_gt_instance_ids"], [])
+            self.assertEqual(metadata["num_cnabu_components"], 3)
+            self.assertEqual(metadata["num_cnabu_matched_components"], 2)
+            self.assertEqual(metadata["pseudo_node_false_positive_count"], 1)
+            self.assertEqual(metadata["cnabu_supervised_pair_count"], 2)
+            self.assertAlmostEqual(metadata["cnabu_node_precision_at_match_threshold"], 2.0 / 3.0)
+            self.assertAlmostEqual(metadata["cnabu_node_recall_at_match_threshold"], 1.0)
+
     def test_option2b_config_file_sets_node_source_and_target_scope(self):
         cfg = get_cfg()
         add_dep_graph_config(cfg)
@@ -424,6 +566,28 @@ class MemObservedGtMapperTest(unittest.TestCase):
         self.assertEqual(cfg.INPUT.MEM_MAP_FEATURE_SOURCE, "raw_plus_cnabu_mean")
         self.assertEqual(cfg.MODEL.MEM_GRAPH.IN_CHANNELS, 46)
         self.assertEqual(cfg.MODEL.MEM_GRAPH.INPUT_NORMALIZATION, "raw_plus_cnabu_mean_v0")
+
+    def test_option2c_cnabu_components_config_sets_node_source_and_feature_source(self):
+        cfg = get_cfg()
+        add_dep_graph_config(cfg)
+        add_detr_config(cfg)
+        cfg.merge_from_file(
+            str(
+                Path(__file__).resolve().parents[1]
+                / "configs"
+                / "mem"
+                / "option2c_cnabu_components_pair_geometry.yaml"
+            )
+        )
+
+        self.assertEqual(cfg.INPUT.MEM_NODE_SOURCE, "cnabu_components")
+        self.assertEqual(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE, "cnabu_induced")
+        self.assertEqual(cfg.INPUT.MEM_MAP_FEATURE_SOURCE, "cnabu_mean")
+        self.assertEqual(cfg.INPUT.MEM_CNABU_NODE_MASKS_FILENAME, "node_masks.npz")
+        self.assertAlmostEqual(cfg.INPUT.MEM_CNABU_MATCH_IOU_THRESHOLD, 0.25)
+        self.assertTrue(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
+        self.assertEqual(cfg.MODEL.MEM_GRAPH.IN_CHANNELS, 16)
+        self.assertEqual(cfg.MODEL.MEM_GRAPH.INPUT_NORMALIZATION, "none")
 
     def test_option2a_config_file_keeps_gt_all_known_node_contract(self):
         cfg = get_cfg()

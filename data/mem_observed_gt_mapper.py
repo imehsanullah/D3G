@@ -29,8 +29,10 @@ DEFAULT_MEM_GRAPH_TARGET_SCOPE = "gt_all"
 DEFAULT_MEM_BOX_MODE = "aabb"
 DEFAULT_MEM_MAP_FEATURE_SOURCE = "raw_observed"
 DEFAULT_MEM_CNABU_PAD_MODE = "prior"
-SUPPORTED_MEM_NODE_SOURCES = ("gt", "observed_instance_maps")
-SUPPORTED_MEM_GRAPH_TARGET_SCOPES = ("gt_all", "observed_induced")
+DEFAULT_MEM_CNABU_NODE_MASKS_FILENAME = "node_masks.npz"
+DEFAULT_MEM_CNABU_MATCH_IOU_THRESHOLD = 0.25
+SUPPORTED_MEM_NODE_SOURCES = ("gt", "observed_instance_maps", "cnabu_components")
+SUPPORTED_MEM_GRAPH_TARGET_SCOPES = ("gt_all", "observed_induced", "cnabu_induced")
 SUPPORTED_MEM_BOX_MODES = ("aabb", "obb_from_mask")
 SUPPORTED_MEM_MAP_FEATURE_SOURCES = ("raw_observed", "cnabu_mean", "raw_plus_cnabu_mean")
 SUPPORTED_MEM_CNABU_PAD_MODES = ("prior", "zero")
@@ -515,10 +517,65 @@ def _resolve_cnabu_hms_path(record: Dict[str, Any], pre_action_dir: Path, data_r
     return candidates[0]
 
 
+def _resolve_cnabu_node_masks_path(
+    record: Dict[str, Any],
+    pre_action_dir: Path,
+    data_root: str,
+    cnabu_derived_root: str,
+    node_masks_filename: str = DEFAULT_MEM_CNABU_NODE_MASKS_FILENAME,
+) -> Path:
+    explicit_path = record.get("cnabu_node_masks_path") or record.get("node_masks_path")
+    if explicit_path:
+        path = Path(str(explicit_path)).expanduser()
+        if not path.is_absolute():
+            path = Path(cnabu_derived_root).expanduser() / path
+        return path
+
+    filename = str(node_masks_filename or DEFAULT_MEM_CNABU_NODE_MASKS_FILENAME).strip()
+    if not filename:
+        raise ValueError("MEM_CNABU_NODE_MASKS_FILENAME must not be empty")
+
+    explicit_cnabu_hms = record.get("cnabu_hms_path")
+    if explicit_cnabu_hms:
+        hms_path = Path(str(explicit_cnabu_hms)).expanduser()
+        if not hms_path.is_absolute():
+            hms_path = Path(cnabu_derived_root).expanduser() / hms_path
+        return hms_path.parent / filename
+
+    if not cnabu_derived_root:
+        raise ValueError(
+            "MEM_NODE_SOURCE='cnabu_components' requires DATASETS.MEM_CNABU_DERIVED_ROOT "
+            "or record['cnabu_node_masks_path']"
+        )
+    derived_root = Path(cnabu_derived_root).expanduser()
+    data_root_path = Path(data_root).expanduser()
+    rel = _path_relative_to_optional_root(pre_action_dir, data_root_path)
+    if rel is None:
+        sample_id = str(record.get("sample_id") or record.get("id") or record.get("image_id") or "").strip()
+        if sample_id:
+            rel = Path(sample_id) / "pre_action"
+        else:
+            raise ValueError(
+                "could not derive CNABU node-mask sample-relative path for {}; set "
+                "record['cnabu_node_masks_path']".format(pre_action_dir)
+            )
+
+    candidates = [
+        derived_root / "samples" / rel / filename,
+        derived_root / rel / filename,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
 def _validate_mem_node_target_pair(mem_node_source: str, mem_graph_target_scope: str) -> None:
     if mem_node_source == "gt" and mem_graph_target_scope == "gt_all":
         return
     if mem_node_source == "observed_instance_maps" and mem_graph_target_scope == "observed_induced":
+        return
+    if mem_node_source == "cnabu_components" and mem_graph_target_scope == "cnabu_induced":
         return
     raise ValueError(
         "unsupported MEM node/target combination: MEM_NODE_SOURCE={!r}, MEM_GRAPH_TARGET_SCOPE={!r}".format(
@@ -533,6 +590,146 @@ def _bbox_xyxy_abs_from_mask(mask: np.ndarray) -> List[int]:
     if ys.size == 0 or xs.size == 0:
         raise ValueError("cannot compute bbox for an empty observed instance mask")
     return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+
+
+def _scalar_string_npz_value(value: Any) -> str:
+    if isinstance(value, np.ndarray):
+        if value.shape == ():
+            value = value.item()
+        elif value.size == 1:
+            value = value.reshape(-1)[0].item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+def load_cnabu_component_node_masks(
+    node_masks_path: Path,
+    *,
+    raw_height: int,
+    raw_width: int,
+    semantic_class_min: int = DEFAULT_SEMANTIC_CLASS_MIN,
+    semantic_class_max: int = DEFAULT_SEMANTIC_CLASS_MAX,
+) -> Dict[str, Any]:
+    """Load the additive CNABU component node contract from ``node_masks.npz``."""
+
+    path = Path(node_masks_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError("missing CNABU component node file: {}".format(path))
+
+    with np.load(path, allow_pickle=False) as data:
+        required = {
+            "node_masks",
+            "node_semantic_labels",
+            "node_scores",
+            "bbox_xyxy_abs",
+            "component_ids",
+            "crop_rows",
+            "node_source",
+        }
+        missing = sorted(required - set(data.files))
+        if missing:
+            raise KeyError("missing required field(s) in {}: {}".format(path, missing))
+        node_source = _scalar_string_npz_value(data["node_source"])
+        if node_source != "cnabu_3d_components":
+            raise ValueError("node_source must be 'cnabu_3d_components', got {!r}".format(node_source))
+        node_masks = np.asarray(data["node_masks"]).astype(bool, copy=False)
+        node_semantic_labels = np.asarray(data["node_semantic_labels"], dtype=np.int64)
+        node_scores = np.asarray(data["node_scores"], dtype=np.float32)
+        bbox_xyxy_abs = np.asarray(data["bbox_xyxy_abs"], dtype=np.float32)
+        component_ids = np.asarray(data["component_ids"], dtype=np.int64)
+        crop_rows = np.asarray(data["crop_rows"], dtype=np.int64)
+        thresholds = np.asarray(data["thresholds"], dtype=np.float32) if "thresholds" in data.files else None
+        matched_gt_instance_ids = (
+            np.asarray(data["matched_gt_instance_ids"], dtype=np.int64)
+            if "matched_gt_instance_ids" in data.files
+            else None
+        )
+        matched_gt_ious = (
+            np.asarray(data["matched_gt_ious"], dtype=np.float32)
+            if "matched_gt_ious" in data.files
+            else None
+        )
+        metadata_json = _metadata_json_to_dict(data["metadata_json"]) if "metadata_json" in data.files else {}
+
+    raw_height = int(raw_height)
+    raw_width = int(raw_width)
+    if node_masks.ndim != 3:
+        raise ValueError("node_masks must have shape [N,H,W], got {}".format(node_masks.shape))
+    num_nodes = int(node_masks.shape[0])
+    if node_masks.shape[1:] != (raw_height, raw_width):
+        raise ValueError(
+            "node_masks spatial shape {} must match raw frame ({}, {})".format(
+                node_masks.shape[1:],
+                raw_height,
+                raw_width,
+            )
+        )
+    for name, array in (
+        ("node_semantic_labels", node_semantic_labels),
+        ("node_scores", node_scores),
+        ("component_ids", component_ids),
+    ):
+        if array.shape != (num_nodes,):
+            raise ValueError("{} must have shape ({},), got {}".format(name, num_nodes, array.shape))
+    if bbox_xyxy_abs.shape != (num_nodes, 4):
+        raise ValueError("bbox_xyxy_abs must have shape ({}, 4), got {}".format(num_nodes, bbox_xyxy_abs.shape))
+    if crop_rows.shape != (2,):
+        raise ValueError("crop_rows must have shape (2,), got {}".format(crop_rows.shape))
+    row_start, row_stop = int(crop_rows[0]), int(crop_rows[1])
+    if row_start < 0 or row_stop > raw_height or row_stop <= row_start:
+        raise ValueError("invalid crop_rows {} for raw height {}".format([row_start, row_stop], raw_height))
+    if matched_gt_instance_ids is not None and matched_gt_instance_ids.shape != (num_nodes,):
+        raise ValueError(
+            "matched_gt_instance_ids must have shape ({},), got {}".format(
+                num_nodes,
+                matched_gt_instance_ids.shape,
+            )
+        )
+    if matched_gt_ious is not None and matched_gt_ious.shape != (num_nodes,):
+        raise ValueError(
+            "matched_gt_ious must have shape ({},), got {}".format(num_nodes, matched_gt_ious.shape)
+        )
+    if num_nodes and np.any(node_masks.reshape(num_nodes, -1).sum(axis=1) <= 0):
+        raise ValueError("node_masks contains an empty component mask")
+    if not np.isfinite(node_scores).all():
+        raise ValueError("node_scores must be finite")
+    if len(set(int(value) for value in component_ids.tolist())) != num_nodes:
+        raise ValueError("component_ids must be unique")
+    invalid_classes = [
+        int(value)
+        for value in node_semantic_labels.tolist()
+        if int(value) < int(semantic_class_min) or int(value) >= int(semantic_class_max)
+    ]
+    if invalid_classes:
+        raise ValueError(
+            "node_semantic_labels must be in [{}, {}), got invalid values {}".format(
+                semantic_class_min,
+                semantic_class_max,
+                sorted(set(invalid_classes)),
+            )
+        )
+    return {
+        "path": str(path),
+        "node_masks": node_masks,
+        "node_semantic_labels": [int(value) for value in node_semantic_labels.tolist()],
+        "node_scores": [float(value) for value in node_scores.tolist()],
+        "bbox_xyxy_abs": bbox_xyxy_abs.astype(np.float32, copy=False),
+        "component_ids": [int(value) for value in component_ids.tolist()],
+        "crop_rows": [row_start, row_stop],
+        "thresholds": thresholds.tolist() if thresholds is not None else None,
+        "matched_gt_instance_ids_from_file": (
+            [int(value) for value in matched_gt_instance_ids.tolist()]
+            if matched_gt_instance_ids is not None
+            else None
+        ),
+        "matched_gt_ious_from_file": (
+            [float(value) for value in matched_gt_ious.tolist()]
+            if matched_gt_ious is not None
+            else None
+        ),
+        "metadata_json": metadata_json,
+    }
 
 
 def _obb_cxcywht_from_mask(mask: np.ndarray) -> List[float]:
@@ -742,6 +939,262 @@ def build_observed_induced_mem_graph_contract(
     }
 
 
+def _load_gt_instance_maps(pre_action_dir: Path) -> np.ndarray:
+    gt_hms_path = Path(pre_action_dir) / "gt_hms.npz"
+    if not gt_hms_path.is_file():
+        raise FileNotFoundError(
+            "MEM_NODE_SOURCE='cnabu_components' requires GT instance masks for IoU matching; "
+            "missing {}".format(gt_hms_path)
+        )
+    with np.load(gt_hms_path, allow_pickle=False) as data:
+        if "instance_maps" not in data.files:
+            raise KeyError("missing required instance_maps in {}".format(gt_hms_path))
+        return np.asarray(data["instance_maps"])
+
+
+def _project_instance_id_mask(instance_maps: np.ndarray, instance_id: int) -> np.ndarray:
+    maps = np.asarray(instance_maps)
+    if maps.ndim == 2:
+        return (maps == int(instance_id)).astype(bool, copy=False)
+    if maps.ndim == 3:
+        return np.any(maps == int(instance_id), axis=0)
+    raise ValueError("GT instance_maps must have shape [H,W] or [V,H,W], got {}".format(maps.shape))
+
+
+def _build_gt_mask_records_for_cnabu_matching(
+    record: Dict[str, Any],
+    pre_action_dir: Path,
+    *,
+    raw_height: int,
+    raw_width: int,
+    semantic_class_min: int,
+    semantic_class_max: int,
+) -> List[Dict[str, Any]]:
+    gt_node_order = _coerce_int_list(record.get("node_order_instance_ids", []))
+    gt_classes = _coerce_int_list(record.get("bbox_categories", []))
+    if len(gt_node_order) != len(gt_classes):
+        raise ValueError("node_order_instance_ids length must match bbox_categories length for CNABU matching")
+    if len(set(gt_node_order)) != len(gt_node_order):
+        raise ValueError("GT node_order_instance_ids must be unique for CNABU component matching")
+
+    gt_instance_maps = _load_gt_instance_maps(pre_action_dir)
+    if gt_instance_maps.ndim == 2:
+        spatial_shape = gt_instance_maps.shape
+    elif gt_instance_maps.ndim == 3:
+        spatial_shape = gt_instance_maps.shape[-2:]
+    else:
+        raise ValueError("GT instance_maps must have shape [H,W] or [V,H,W], got {}".format(gt_instance_maps.shape))
+    if tuple(spatial_shape) != (int(raw_height), int(raw_width)):
+        raise ValueError(
+            "GT instance_maps spatial shape {} must match raw frame ({}, {})".format(
+                spatial_shape,
+                raw_height,
+                raw_width,
+            )
+        )
+
+    records: List[Dict[str, Any]] = []
+    for gt_index, (instance_id, class_id) in enumerate(zip(gt_node_order, gt_classes)):
+        if int(class_id) < int(semantic_class_min) or int(class_id) >= int(semantic_class_max):
+            continue
+        mask = _project_instance_id_mask(gt_instance_maps, int(instance_id))
+        if not bool(mask.any()):
+            raise ValueError(
+                "GT instance id {} from node_order_instance_ids has no pixels in gt_hms.npz".format(instance_id)
+            )
+        records.append(
+            {
+                "gt_index": int(gt_index),
+                "instance_id": int(instance_id),
+                "class_id": int(class_id),
+                "mask": mask.astype(bool, copy=False),
+                "area": int(mask.sum()),
+            }
+        )
+    return records
+
+
+def _class_aware_iou_matrix(
+    pred_masks: np.ndarray,
+    pred_classes: Sequence[int],
+    gt_records: Sequence[Dict[str, Any]],
+) -> np.ndarray:
+    pred_masks = np.asarray(pred_masks).astype(bool, copy=False)
+    matrix = np.zeros((int(pred_masks.shape[0]), len(gt_records)), dtype=np.float64)
+    for pred_index, (pred_mask, pred_class) in enumerate(zip(pred_masks, pred_classes)):
+        pred_area = int(pred_mask.sum())
+        if pred_area <= 0:
+            continue
+        for gt_index, gt_record in enumerate(gt_records):
+            if int(pred_class) != int(gt_record["class_id"]):
+                continue
+            gt_mask = np.asarray(gt_record["mask"], dtype=bool)
+            intersection = int(np.logical_and(pred_mask, gt_mask).sum())
+            if intersection <= 0:
+                continue
+            union = int(pred_area + int(gt_record["area"]) - intersection)
+            matrix[pred_index, gt_index] = float(intersection) / float(union) if union > 0 else 0.0
+    return matrix
+
+
+def _hungarian_class_aware_matches(
+    pred_masks: np.ndarray,
+    pred_classes: Sequence[int],
+    gt_records: Sequence[Dict[str, Any]],
+    *,
+    iou_threshold: float,
+) -> Tuple[List[Optional[int]], List[float], np.ndarray]:
+    num_pred = int(np.asarray(pred_masks).shape[0])
+    matched_gt_record_indices: List[Optional[int]] = [None for _ in range(num_pred)]
+    matched_ious: List[float] = [0.0 for _ in range(num_pred)]
+    iou_matrix = _class_aware_iou_matrix(pred_masks, pred_classes, gt_records)
+    if num_pred == 0 or len(gt_records) == 0:
+        return matched_gt_record_indices, matched_ious, iou_matrix
+
+    from scipy.optimize import linear_sum_assignment  # local import keeps mapper import lightweight
+
+    pred_indices, gt_indices = linear_sum_assignment(-iou_matrix)
+    threshold = float(iou_threshold)
+    for pred_index, gt_record_index in zip(pred_indices.tolist(), gt_indices.tolist()):
+        iou = float(iou_matrix[pred_index, gt_record_index])
+        if iou >= threshold and iou > 0.0:
+            matched_gt_record_indices[int(pred_index)] = int(gt_record_index)
+            matched_ious[int(pred_index)] = iou
+    return matched_gt_record_indices, matched_ious, iou_matrix
+
+
+def build_cnabu_component_induced_mem_graph_contract(
+    record: Dict[str, Any],
+    node_contract: Dict[str, Any],
+    pre_action_dir: Path,
+    *,
+    raw_height: int,
+    raw_width: int,
+    semantic_class_min: int = DEFAULT_SEMANTIC_CLASS_MIN,
+    semantic_class_max: int = DEFAULT_SEMANTIC_CLASS_MAX,
+    match_iou_threshold: float = DEFAULT_MEM_CNABU_MATCH_IOU_THRESHOLD,
+) -> Dict[str, Any]:
+    """Build Option 2C pseudo-nodes and GT graph labels via class-aware IoU matching."""
+
+    node_masks = np.asarray(node_contract["node_masks"]).astype(bool, copy=False)
+    component_ids = _coerce_int_list(node_contract["component_ids"])
+    classes = _coerce_int_list(node_contract["node_semantic_labels"])
+    scores = [float(value) for value in node_contract["node_scores"]]
+    num_nodes = int(node_masks.shape[0])
+    if len(component_ids) != num_nodes or len(classes) != num_nodes or len(scores) != num_nodes:
+        raise ValueError("CNABU component ids/classes/scores must match node_masks count")
+
+    gt_node_order = _coerce_int_list(record.get("node_order_instance_ids", []))
+    full_graph = _as_graph_tensor(record.get("graph_gt", []), "graph_gt", len(gt_node_order))
+    gt_records = _build_gt_mask_records_for_cnabu_matching(
+        record,
+        pre_action_dir,
+        raw_height=int(raw_height),
+        raw_width=int(raw_width),
+        semantic_class_min=int(semantic_class_min),
+        semantic_class_max=int(semantic_class_max),
+    )
+    matched_gt_record_indices, matched_ious, iou_matrix = _hungarian_class_aware_matches(
+        node_masks,
+        classes,
+        gt_records,
+        iou_threshold=float(match_iou_threshold),
+    )
+
+    matched_gt_indices: List[Optional[int]] = [None for _ in range(num_nodes)]
+    matched_gt_instance_ids: List[int] = [-1 for _ in range(num_nodes)]
+    cnabu_node_records: List[Dict[str, Any]] = []
+    matched_component_ids: List[int] = []
+    unmatched_component_ids: List[int] = []
+    for node_index, gt_record_index in enumerate(matched_gt_record_indices):
+        gt_record = gt_records[gt_record_index] if gt_record_index is not None else None
+        if gt_record is None:
+            unmatched_component_ids.append(int(component_ids[node_index]))
+        else:
+            matched_gt_indices[node_index] = int(gt_record["gt_index"])
+            matched_gt_instance_ids[node_index] = int(gt_record["instance_id"])
+            matched_component_ids.append(int(component_ids[node_index]))
+        cnabu_node_records.append(
+            {
+                "node_index": int(node_index),
+                "component_id": int(component_ids[node_index]),
+                "semantic_class_id": int(classes[node_index]),
+                "node_score": float(scores[node_index]),
+                "bbox_xyxy_abs": [float(value) for value in np.asarray(node_contract["bbox_xyxy_abs"])[node_index].tolist()],
+                "matched_gt_instance_id": int(matched_gt_instance_ids[node_index]),
+                "matched_gt_index": (
+                    int(matched_gt_indices[node_index]) if matched_gt_indices[node_index] is not None else None
+                ),
+                "matched_gt_iou": float(matched_ious[node_index]),
+            }
+        )
+
+    induced_graph = torch.zeros((num_nodes, num_nodes), dtype=torch.long)
+    graph_loss_mask = torch.zeros((num_nodes, num_nodes), dtype=torch.bool)
+    for source_index, source_gt_index in enumerate(matched_gt_indices):
+        if source_gt_index is None:
+            continue
+        for target_index, target_gt_index in enumerate(matched_gt_indices):
+            if target_gt_index is None or source_index == target_index:
+                continue
+            induced_graph[source_index, target_index] = full_graph[int(source_gt_index), int(target_gt_index)]
+            graph_loss_mask[source_index, target_index] = True
+
+    matched_gt_instance_set = {instance_id for instance_id in matched_gt_instance_ids if instance_id >= 0}
+    gt_matchable_ids = [int(record["instance_id"]) for record in gt_records]
+    unmatched_gt_instance_ids = [
+        int(instance_id) for instance_id in gt_matchable_ids if int(instance_id) not in matched_gt_instance_set
+    ]
+    matched_count = int(len(matched_component_ids))
+    precision = float(matched_count / num_nodes) if num_nodes else 0.0
+    recall = float(matched_count / len(gt_records)) if gt_records else 0.0
+    f1 = float((2.0 * precision * recall) / (precision + recall)) if precision + recall > 0.0 else 0.0
+
+    return {
+        "node_order_instance_ids": component_ids,
+        "bbox_xyxy_abs": np.asarray(node_contract["bbox_xyxy_abs"], dtype=np.float32),
+        "bbox_categories": classes,
+        "node_masks": node_masks,
+        "graph_gt": induced_graph,
+        "dense_gt": induced_graph.clone(),
+        "graph_loss_mask": graph_loss_mask,
+        "cnabu_node_records": cnabu_node_records,
+        "metadata": {
+            "cnabu_node_masks_path": str(node_contract["path"]),
+            "cnabu_node_source": "cnabu_3d_components",
+            "cnabu_component_ids": component_ids,
+            "cnabu_component_scores": scores,
+            "cnabu_component_crop_rows": node_contract["crop_rows"],
+            "cnabu_component_thresholds": node_contract.get("thresholds"),
+            "cnabu_component_metadata": node_contract.get("metadata_json", {}),
+            "cnabu_node_records": cnabu_node_records,
+            "cnabu_matched_component_ids": matched_component_ids,
+            "cnabu_unmatched_component_ids": unmatched_component_ids,
+            "cnabu_matched_gt_instance_ids": matched_gt_instance_ids,
+            "cnabu_matched_gt_ious": [float(value) for value in matched_ious],
+            "cnabu_gt_matchable_instance_ids": gt_matchable_ids,
+            "cnabu_unmatched_gt_instance_ids": unmatched_gt_instance_ids,
+            "cnabu_match_iou_threshold": float(match_iou_threshold),
+            "cnabu_class_aware_iou_matrix_shape": [int(dim) for dim in iou_matrix.shape],
+            "num_cnabu_components": int(num_nodes),
+            "num_cnabu_matched_components": matched_count,
+            "num_cnabu_unmatched_components": int(len(unmatched_component_ids)),
+            "num_cnabu_gt_matchable_instances": int(len(gt_records)),
+            "num_cnabu_unmatched_gt_instances": int(len(unmatched_gt_instance_ids)),
+            "pseudo_node_false_positive_count": int(len(unmatched_component_ids)),
+            "gt_node_false_negative_count": int(len(unmatched_gt_instance_ids)),
+            "cnabu_node_precision_at_match_threshold": precision,
+            "cnabu_node_recall_at_match_threshold": recall,
+            "cnabu_node_f1_at_match_threshold": f1,
+            "cnabu_supervised_pair_count": int(graph_loss_mask.sum().item()),
+            "target_scope_note": (
+                "GT graph induced over all CNABU pseudo-nodes; directed graph loss/eval are masked "
+                "to class-aware IoU/Hungarian matched pseudo-node pairs"
+            ),
+        },
+    }
+
+
 class MemObservedGtMapper:
 
     """Map one MEM Option 2A/2B record into D3G's mapper item structure."""
@@ -765,6 +1218,8 @@ class MemObservedGtMapper:
         mem_map_feature_source: str = DEFAULT_MEM_MAP_FEATURE_SOURCE,
         cnabu_derived_root: str = "",
         cnabu_pad_mode: str = DEFAULT_MEM_CNABU_PAD_MODE,
+        cnabu_node_masks_filename: str = DEFAULT_MEM_CNABU_NODE_MASKS_FILENAME,
+        cnabu_match_iou_threshold: float = DEFAULT_MEM_CNABU_MATCH_IOU_THRESHOLD,
     ) -> None:
         if graph_gt_type != "dense":
             raise ValueError("MemObservedGtMapper currently supports only INPUT.GRAPH_GT_TYPE='dense'")
@@ -775,6 +1230,10 @@ class MemObservedGtMapper:
         self.mem_map_feature_source = _normalise_mem_map_feature_source(mem_map_feature_source)
         self.cnabu_derived_root = str(cnabu_derived_root or "")
         self.cnabu_pad_mode = _normalise_mem_cnabu_pad_mode(cnabu_pad_mode)
+        self.cnabu_node_masks_filename = str(cnabu_node_masks_filename or DEFAULT_MEM_CNABU_NODE_MASKS_FILENAME)
+        self.cnabu_match_iou_threshold = float(cnabu_match_iou_threshold)
+        if self.cnabu_match_iou_threshold < 0.0 or self.cnabu_match_iou_threshold > 1.0:
+            raise ValueError("MEM_CNABU_MATCH_IOU_THRESHOLD must be in [0,1]")
         self.data_root = data_root
         self.is_train = is_train
         self.graph_gt_type = graph_gt_type
@@ -805,6 +1264,16 @@ class MemObservedGtMapper:
             "mem_map_feature_source": getattr(cfg.INPUT, "MEM_MAP_FEATURE_SOURCE", DEFAULT_MEM_MAP_FEATURE_SOURCE),
             "cnabu_derived_root": getattr(cfg.DATASETS, "MEM_CNABU_DERIVED_ROOT", ""),
             "cnabu_pad_mode": getattr(cfg.INPUT, "MEM_CNABU_PAD_MODE", DEFAULT_MEM_CNABU_PAD_MODE),
+            "cnabu_node_masks_filename": getattr(
+                cfg.INPUT,
+                "MEM_CNABU_NODE_MASKS_FILENAME",
+                DEFAULT_MEM_CNABU_NODE_MASKS_FILENAME,
+            ),
+            "cnabu_match_iou_threshold": getattr(
+                cfg.INPUT,
+                "MEM_CNABU_MATCH_IOU_THRESHOLD",
+                DEFAULT_MEM_CNABU_MATCH_IOU_THRESHOLD,
+            ),
         }
 
     def __call__(self, dataset_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -881,6 +1350,9 @@ class MemObservedGtMapper:
             raise ValueError("record width {} does not match materialized width {}".format(record["width"], width))
 
         observed_induced_metadata: Dict[str, Any] = {}
+        visible_blocks_hidden_target: Optional[torch.Tensor] = None
+        graph_loss_mask: Optional[torch.Tensor] = None
+        node_masks_np: Optional[np.ndarray] = None
         obb_source = "aabb_lifted_zero_theta"
         if self.mem_node_source == "gt":
             classes = torch.as_tensor(_coerce_int_list(record.get("bbox_categories", [])), dtype=torch.long)
@@ -901,7 +1373,7 @@ class MemObservedGtMapper:
                 if not torch.equal(dense_gt, graph_gt):
                     raise ValueError("dense_gt must match graph_gt for the MEM-specific dense route")
             is_oracle_node_conditioned = bool(record.get("is_oracle_node_conditioned", True))
-        else:
+        elif self.mem_node_source == "observed_instance_maps":
             observed_contract = build_observed_induced_mem_graph_contract(
                 record,
                 observed_instance_maps,
@@ -924,6 +1396,53 @@ class MemObservedGtMapper:
             observed_induced_metadata = dict(observed_contract["metadata"])
             visible_blocks_hidden_target = observed_contract["visible_blocks_hidden_target"].to(dtype=torch.float32)
             is_oracle_node_conditioned = False
+        elif self.mem_node_source == "cnabu_components":
+            node_masks_path = _resolve_cnabu_node_masks_path(
+                record,
+                pre_action_dir,
+                self.data_root,
+                self.cnabu_derived_root,
+                self.cnabu_node_masks_filename,
+            )
+            node_contract = load_cnabu_component_node_masks(
+                node_masks_path,
+                raw_height=height,
+                raw_width=width,
+                semantic_class_min=self.semantic_class_min,
+                semantic_class_max=self.semantic_class_max,
+            )
+            cnabu_contract = build_cnabu_component_induced_mem_graph_contract(
+                record,
+                node_contract,
+                pre_action_dir,
+                raw_height=height,
+                raw_width=width,
+                semantic_class_min=self.semantic_class_min,
+                semantic_class_max=self.semantic_class_max,
+                match_iou_threshold=self.cnabu_match_iou_threshold,
+            )
+            node_order = _coerce_int_list(cnabu_contract["node_order_instance_ids"])
+            classes = torch.as_tensor(_coerce_int_list(cnabu_contract["bbox_categories"]), dtype=torch.long)
+            num_nodes = int(classes.numel())
+            boxes = _boxes_tensor(cnabu_contract["bbox_xyxy_abs"], num_nodes, height, width)
+            node_masks_np = np.asarray(cnabu_contract["node_masks"]).astype(bool, copy=False)
+            if self.mem_box_mode == "obb_from_mask":
+                obb = torch.as_tensor(
+                    [_obb_cxcywht_from_mask(mask) for mask in node_masks_np],
+                    dtype=torch.float32,
+                )
+                if num_nodes == 0:
+                    obb = torch.zeros((0, 5), dtype=torch.float32)
+                obb_source = "obb_from_cnabu_component_mask"
+            else:
+                obb = _obb_cxcywht_from_xyxy(boxes)
+            graph_gt = cnabu_contract["graph_gt"].to(dtype=torch.long)
+            dense_gt = cnabu_contract["dense_gt"].to(dtype=torch.long)
+            graph_loss_mask = cnabu_contract["graph_loss_mask"].to(dtype=torch.bool)
+            observed_induced_metadata = dict(cnabu_contract["metadata"])
+            is_oracle_node_conditioned = False
+        else:
+            raise AssertionError("unhandled MEM node source: {}".format(self.mem_node_source))
 
         instances = structures.Instances(
             image_size=(height, width),
@@ -931,6 +1450,11 @@ class MemObservedGtMapper:
             gt_classes=classes,
         )
         instances.set("gt_obb_cxcywht", obb)
+        if node_masks_np is not None:
+            instances.set(
+                "gt_masks",
+                structures.BitMasks(torch.as_tensor(node_masks_np.astype(np.uint8), dtype=torch.uint8)),
+            )
         sample_id = record.get("sample_id") or str(pre_action_dir)
 
         output = {
@@ -970,6 +1494,8 @@ class MemObservedGtMapper:
                 "runs_training": False,
             },
         }
+        if graph_loss_mask is not None:
+            output["graph_loss_mask"] = graph_loss_mask
         if self.mem_node_source == "observed_instance_maps":
             output["visible_blocks_hidden_target"] = visible_blocks_hidden_target
         return output
@@ -980,7 +1506,9 @@ __all__ = [
     "DEFAULT_MEM_GRAPH_TARGET_SCOPE",
     "DEFAULT_MEM_NODE_SOURCE",
     "MemObservedGtMapper",
+    "build_cnabu_component_induced_mem_graph_contract",
     "build_observed_induced_mem_graph_contract",
+    "load_cnabu_component_node_masks",
     "materialize_mem_cnabu_mean_tensor",
     "materialize_mem_observed_tensor",
     "select_mem_observed_view_indices",

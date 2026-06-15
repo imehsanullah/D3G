@@ -93,6 +93,34 @@ class MemGraphDenseTest(unittest.TestCase):
         self.assertEqual(direct_stats["num_positive_edges"], 1)
         self.assertEqual(transposed_stats["target_shape"], [2, 2])
 
+    def test_masked_dense_graph_loss_uses_optional_supervision_mask(self):
+        target = torch.tensor(
+            [
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+            ]
+        )
+        logits = torch.zeros(3, 3)
+        supervision_mask = torch.tensor(
+            [
+                [False, True, False],
+                [True, False, False],
+                [False, False, False],
+            ]
+        )
+
+        loss, stats = masked_dense_graph_bce_loss(
+            logits,
+            target,
+            supervision_mask=supervision_mask,
+            return_diagnostics=True,
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(stats["num_pairs"], 2)
+        self.assertEqual(stats["num_positive_edges"], 1)
+
     def test_masked_dense_graph_loss_rejects_non_binary_targets_and_self_loops(self):
         logits = torch.zeros(2, 2)
 
@@ -410,6 +438,19 @@ class MemGraphDenseTest(unittest.TestCase):
         self.assertTrue(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
         self.assertFalse(cfg.MODEL.MEM_GRAPH.VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED)
         self.assertIn("front_x_overlap_union", list(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_FEATURES))
+
+    def test_option2c_cnabu_components_pair_geometry_config_enables_pseudo_node_path(self):
+        cfg = get_cfg()
+        add_dep_graph_config(cfg)
+        add_detr_config(cfg)
+        cfg.merge_from_file("configs/mem/option2c_cnabu_components_pair_geometry.yaml")
+
+        self.assertEqual(cfg.INPUT.MEM_NODE_SOURCE, "cnabu_components")
+        self.assertEqual(cfg.INPUT.MEM_GRAPH_TARGET_SCOPE, "cnabu_induced")
+        self.assertEqual(cfg.INPUT.MEM_MAP_FEATURE_SOURCE, "cnabu_mean")
+        self.assertEqual(cfg.INPUT.MEM_CNABU_NODE_MASKS_FILENAME, "node_masks.npz")
+        self.assertTrue(cfg.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
+        self.assertEqual(cfg.MODEL.MEM_GRAPH.IN_CHANNELS, 16)
 
     def test_option2b_pair_geometry_visible_hidden_aux_config_only_enables_aux_path(self):
         pair_geometry_path = Path("configs/mem/option2b_observed_visible_nodes_pair_geometry.yaml")

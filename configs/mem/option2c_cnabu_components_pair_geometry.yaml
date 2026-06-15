@@ -1,0 +1,17 @@
+_BASE_: 'option2b_observed_visible_nodes_pair_geometry_cnabu_mean.yaml'
+
+DATASETS:
+  TRAIN: ("mem_option2c_cnabu_components_pair_geometry",)
+  TEST: ("mem_option2c_cnabu_components_pair_geometry",)
+
+INPUT:
+  MEM_NODE_SOURCE: "cnabu_components"
+  MEM_GRAPH_TARGET_SCOPE: "cnabu_induced"
+  MEM_CNABU_NODE_MASKS_FILENAME: "node_masks.npz"
+  MEM_CNABU_MATCH_IOU_THRESHOLD: 0.25
+
+MODEL:
+  MEM_GRAPH:
+    IN_CHANNELS: 16
+    INPUT_NORMALIZATION: "none"
+    SEMANTIC_MAX_VALUE: 1.0

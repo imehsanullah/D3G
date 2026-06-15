@@ -27,6 +27,8 @@ def add_dep_graph_config(cfg):
     cfg.INPUT.MEM_BOX_MODE = 'aabb'
     cfg.INPUT.MEM_MAP_FEATURE_SOURCE = 'raw_observed'
     cfg.INPUT.MEM_CNABU_PAD_MODE = 'prior'
+    cfg.INPUT.MEM_CNABU_NODE_MASKS_FILENAME = 'node_masks.npz'
+    cfg.INPUT.MEM_CNABU_MATCH_IOU_THRESHOLD = 0.25
     cfg.DATASETS.ROOT = './datasets'
     cfg.DATASETS.MEM_RECORDS_JSON = ''
     cfg.DATASETS.MEM_SPLIT_JSON = ''

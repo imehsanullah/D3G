@@ -56,6 +56,7 @@ def masked_dense_graph_bce_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
     *,
+    supervision_mask: Optional[torch.Tensor] = None,
     mask_diagonal: bool = True,
     require_zero_diagonal: bool = True,
     pos_weight: Optional[float] = None,
@@ -79,6 +80,14 @@ def masked_dense_graph_bce_loss(
     _check_dense_graph_target(target, require_zero_diagonal=require_zero_diagonal)
 
     mask = torch.ones_like(target, dtype=torch.bool)
+    if supervision_mask is not None:
+        supervision_mask = supervision_mask.to(device=logits.device, dtype=torch.bool)
+        if supervision_mask.shape != target.shape:
+            raise ValueError(
+                f"graph supervision mask must match target shape, got {tuple(supervision_mask.shape)} "
+                f"and {tuple(target.shape)}"
+            )
+        mask = mask & supervision_mask
     if mask_diagonal:
         diagonal = torch.eye(target.shape[-1], dtype=torch.bool, device=target.device)
         if target.dim() == 3:
@@ -86,7 +95,18 @@ def masked_dense_graph_bce_loss(
         mask = mask & ~diagonal
 
     if not torch.any(mask):
-        raise ValueError("graph loss mask selected zero node pairs")
+        if supervision_mask is None:
+            raise ValueError("graph loss mask selected zero node pairs")
+        loss = logits.sum() * 0.0
+        if not return_diagnostics:
+            return loss
+        diagnostics: Dict[str, Union[int, float, List[int]]] = {
+            "target_shape": original_shape,
+            "num_pairs": 0,
+            "num_positive_edges": 0,
+            "positive_edge_ratio": 0.0,
+        }
+        return loss, diagnostics
 
     selected_logits = logits[mask]
     selected_target = target[mask]
@@ -569,6 +589,7 @@ class MemGraphDenseKnownNodes(nn.Module):
             loss = masked_dense_graph_bce_loss(
                 graph_logits,
                 target,
+                supervision_mask=item.get("graph_loss_mask", None),
                 mask_diagonal=self.mask_graph_diagonal,
                 require_zero_diagonal=True,
                 pos_weight=self.graph_loss_pos_weight,

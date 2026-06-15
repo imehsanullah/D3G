@@ -37,6 +37,9 @@ OPTION2B_PAIR_GEOMETRY_CNABU_MEAN_CONFIG = (
 OPTION2B_PAIR_GEOMETRY_RAW_PLUS_CNABU_MEAN_CONFIG = (
     REPO_ROOT / "configs" / "mem" / "option2b_observed_visible_nodes_pair_geometry_raw_plus_cnabu_mean.yaml"
 )
+OPTION2C_CNABU_COMPONENTS_PAIR_GEOMETRY_CONFIG = (
+    REPO_ROOT / "configs" / "mem" / "option2c_cnabu_components_pair_geometry.yaml"
+)
 
 
 class MemGraphTrainerTest(unittest.TestCase):
@@ -64,12 +67,55 @@ class MemGraphTrainerTest(unittest.TestCase):
             depths=np.zeros((10, 16, 16), dtype=np.float32),
         )
 
+    def _write_option2c_cnabu_files(self, cnabu_root: Path, sample_rel: Path) -> None:
+        cnabu_path = cnabu_root / "samples" / sample_rel / "cnabu_hms.npz"
+        cnabu_path.parent.mkdir(parents=True, exist_ok=True)
+        occupancy_mean = np.full((2, 8, 12), 0.8, dtype=np.float32)
+        semantic_mean = np.full((15, 8, 12), 1.0 / 15.0, dtype=np.float32)
+        semantic_mean[0, 0:4, 0:5] = 0.9
+        semantic_mean[1, 4:8, 5:12] = 0.9
+        semantic_mean[2, 0:2, 9:12] = 0.9
+        semantic_mean = semantic_mean / np.maximum(semantic_mean.sum(axis=0, keepdims=True), 1e-8)
+        np.savez(
+            cnabu_path,
+            occupancy_mean=occupancy_mean,
+            semantic_mean=semantic_mean,
+            selected_view_indices=np.asarray(list(range(10)), dtype=np.int16),
+            crop_rows=np.asarray([0, 8], dtype=np.int16),
+            metadata_json=np.asarray(json.dumps({"source": "synthetic_option2c_cnabu"})),
+        )
+
+        masks = np.zeros((3, 8, 12), dtype=np.uint8)
+        masks[0, 0:4, 0:5] = 1
+        masks[1, 4:8, 5:12] = 1
+        masks[2, 0:2, 9:12] = 1
+        np.savez(
+            cnabu_path.parent / "node_masks.npz",
+            node_masks=masks,
+            node_semantic_labels=np.asarray([0, 1, 2], dtype=np.int16),
+            node_scores=np.asarray([0.95, 0.90, 0.70], dtype=np.float32),
+            bbox_xyxy_abs=np.asarray([[0, 0, 5, 4], [5, 4, 12, 8], [9, 0, 12, 2]], dtype=np.int16),
+            component_ids=np.asarray([101, 202, 303], dtype=np.int32),
+            crop_rows=np.asarray([0, 8], dtype=np.int16),
+            thresholds=np.asarray([0.5, 0.0], dtype=np.float32),
+            node_source=np.asarray("cnabu_3d_components"),
+            metadata_json=np.asarray(json.dumps({"source": "synthetic_option2c_nodes"})),
+        )
+
+    def _write_option2c_gt_hms(self, pre_action_dir: Path) -> None:
+        gt_instance_maps = np.zeros((8, 12), dtype=np.int32)
+        gt_instance_maps[0:4, 0:5] = 1
+        gt_instance_maps[4:8, 5:12] = 2
+        np.savez(pre_action_dir / "gt_hms.npz", instance_maps=gt_instance_maps)
+
     def _write_records_and_split(
         self,
         tmpdir: Path,
         *,
         option2b_instances: bool = False,
         hidden_gt_node: bool = False,
+        option2c_components: bool = False,
+        cnabu_root=None,
     ):
         records = []
         split_ids = {"train": [], "val": [], "test": []}
@@ -78,6 +124,12 @@ class MemGraphTrainerTest(unittest.TestCase):
             sample_id = f"{scene}/000000000"
             pre_action_dir = tmpdir / scene / "000000000" / "pre_action"
             self._write_hms_npz(pre_action_dir, option2b_instances=option2b_instances)
+            if option2c_components:
+                if cnabu_root is None:
+                    raise ValueError("cnabu_root is required for option2c_components")
+                sample_rel = Path(scene) / "000000000" / "pre_action"
+                self._write_option2c_gt_hms(pre_action_dir)
+                self._write_option2c_cnabu_files(cnabu_root, sample_rel)
             if hidden_gt_node:
                 bbox_xyxy_abs = [[0, 0, 5, 4], [5, 4, 12, 8], [0, 4, 5, 8]]
                 bbox_categories = [0, 1, 2]
@@ -183,6 +235,17 @@ class MemGraphTrainerTest(unittest.TestCase):
         self.assertEqual(cfg_concat.INPUT.MEM_MAP_FEATURE_SOURCE, "raw_plus_cnabu_mean")
         self.assertEqual(cfg_concat.MODEL.MEM_GRAPH.IN_CHANNELS, 46)
         self.assertEqual(cfg_concat.MODEL.MEM_GRAPH.INPUT_NORMALIZATION, "raw_plus_cnabu_mean_v0")
+
+        cfg_option2c = setup_mem_graph_cfg(
+            OPTION2C_CNABU_COMPONENTS_PAIR_GEOMETRY_CONFIG,
+            device="cpu",
+            cfg_overrides=self._tiny_overrides(),
+        )
+        self.assertEqual(cfg_option2c.INPUT.MEM_NODE_SOURCE, "cnabu_components")
+        self.assertEqual(cfg_option2c.INPUT.MEM_GRAPH_TARGET_SCOPE, "cnabu_induced")
+        self.assertEqual(cfg_option2c.INPUT.MEM_MAP_FEATURE_SOURCE, "cnabu_mean")
+        self.assertTrue(cfg_option2c.MODEL.MEM_GRAPH.PAIR_GEOMETRY_ENABLED)
+        self.assertEqual(cfg_option2c.MODEL.MEM_GRAPH.IN_CHANNELS, 16)
 
     def test_manifest_loading_registers_scene_disjoint_splits(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -496,6 +559,51 @@ class MemGraphTrainerTest(unittest.TestCase):
             self.assertIn("PAIR_GEOMETRY_ENABLED: true", saved_config)
             self.assertIn("VISIBLE_BLOCKS_HIDDEN_AUX_ENABLED: false", saved_config)
             self.assertFalse(any(path.suffix in {".pth", ".pt", ".ckpt", ".h5", ".hdf5"} for path in output_dir.rglob("*")))
+
+    def test_tiny_option2c_train_eval_reports_cnabu_component_counts_and_supervised_pairs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            cnabu_root = tmpdir / "cnabu"
+            records_json, split_json, _ = self._write_records_and_split(
+                tmpdir,
+                option2c_components=True,
+                cnabu_root=cnabu_root,
+            )
+            output_dir = tmpdir / "option2c_cnabu_components_run"
+
+            summary = run_mem_graph_training(
+                config_file=OPTION2C_CNABU_COMPONENTS_PAIR_GEOMETRY_CONFIG,
+                records_json=records_json,
+                split_json=split_json,
+                output_dir=output_dir,
+                data_root=str(tmpdir),
+                device="cpu",
+                max_iter=1,
+                seed=0,
+                cfg_overrides=self._tiny_overrides()
+                + [
+                    "DATASETS.MEM_CNABU_DERIVED_ROOT",
+                    str(cnabu_root),
+                ],
+                enable_checkpoints=False,
+                thresholds=[0.5, 0.3, 0.15],
+            )
+
+            self.assertEqual(summary["mem_node_source"], "cnabu_components")
+            self.assertEqual(summary["mem_graph_target_scope"], "cnabu_induced")
+            self.assertTrue(summary["mem_pair_geometry_enabled"])
+            self.assertEqual(summary["train_target_summary"]["num_nodes"], 3)
+            self.assertEqual(summary["train_target_summary"]["num_non_diagonal_pairs"], 2)
+            self.assertEqual(summary["train_target_summary"]["num_total_non_diagonal_pairs"], 6)
+            self.assertTrue(summary["train_target_summary"]["uses_graph_loss_mask"])
+            counts = summary["validation_metrics"]["cnabu_component_node_counts"]
+            self.assertEqual(counts["num_cnabu_components"], 3)
+            self.assertEqual(counts["num_cnabu_matched_components"], 2)
+            self.assertEqual(counts["num_cnabu_unmatched_components"], 1)
+            self.assertEqual(counts["pseudo_node_false_positive_count"], 1)
+            self.assertEqual(counts["gt_node_false_negative_count"], 0)
+            self.assertEqual(summary["validation_metrics"]["num_pairs"], 2)
+            self.assertFalse(summary["safety"]["writes_checkpoints_or_model_outputs"])
 
     def test_tiny_option2b_pair_geometry_obb_train_eval_uses_obb_features(self):
         with tempfile.TemporaryDirectory() as tmp:
