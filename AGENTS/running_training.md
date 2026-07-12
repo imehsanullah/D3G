@@ -8,7 +8,7 @@ This project uses a two-stage training flow:
 The full dataset is already available through the repository symlink:
 
 ```bash
-cd /home/user/ehsanullahm1/thesis/D3G
+cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G
 ls -l datasets
 ```
 
@@ -51,7 +51,7 @@ checkpoints/pretrain_metagraspnetv2_maskrcnn.pth
 
 ```bash
 conda activate d3g
-cd /home/user/ehsanullahm1/thesis/D3G
+cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G
 ```
 
 ## DETR Pipeline
@@ -226,42 +226,3 @@ SOLVER.IMS_PER_BATCH=16
 If `/tmp` is cleaned by the system, the `datasets` symlink will break and the dataset must be restored using `AGENTS/downloading_datasets.md`.
 
 Full graph/relation training should not be started until the relevant `pretrain_metagraspnetv2_*.pth` checkpoint exists, unless intentionally training from scratch by overriding `MODEL.WEIGHTS`.
-
-## MEM thesis trainer/evaluator path
-
-For Ehsan's MEM scene-graph thesis adaptation, use the dedicated manifest-driven trainer instead of `main.py`:
-
-```bash
-/home/user/ehsanullahm1/miniconda3/envs/d3g/bin/python tools/train_mem_graph.py \
-  --config-file configs/mem/option2a_gt_known_nodes.yaml \
-  --records-json <records.json> \
-  --split-json <split_manifest.json> \
-  --data-root /data/manipulation_map_data/raw/map_data \
-  --output-dir <new_output_dir> \
-  --device cuda:0 \
-  --max-iter <iters> \
-  --loss-mode train_pos_weighted_bce
-```
-
-Mode configs:
-
-- `configs/mem/option2a_gt_known_nodes.yaml`: observed MEM maps plus GT/oracle nodes, target scope `gt_all`.
-- `configs/mem/option2b_observed_visible_nodes.yaml`: observed MEM maps plus observed `hms.npz/instance_maps` visible nodes, target scope `observed_induced`.
-
-Output policy and reproducibility details as of 2026-05-08:
-
-- Checkpoints/model files are disabled by default; do not pass `--enable-checkpoints` unless Ehsan explicitly approves.
-- The output dir refuses overwrite by default.
-- Expected artifacts are `command.json`, `config.yaml`, `metrics.json`, `split_manifest.json`, `artifact_inventory.json`, and `summary.json`.
-- Optional selected-sample prediction dumps are available only via explicit `--prediction-dump-dir PATH --prediction-dump-sample-ids ID1,ID2,...`; the trainer refuses a dump directory without sample IDs to avoid accidental full prediction export.
-- `config.yaml` is the effective merged config and includes CLI-selected records path, split path, data root, output dir, max iterations, loss mode, LR, and device.
-- Captured stdout JSON should match saved `summary.json` exactly.
-- Keep `.pth`, `.pt`, `.ckpt`, `.h5`, and `.hdf5` outputs disabled unless explicitly approved.
-
-Current validated local debug boundary:
-
-- Proper-trainer 100-record Option 2A/2B comparison has run on moncheri `cuda:0`, 200 iterations per mode, seeds 0 and 1, `train_pos_weighted_bce`, no checkpoints/model/HDF5 artifacts.
-- A 500-record scene-disjoint manifest was prepared under `/home/user/ehsanullahm1/thesis/thesis_records/diagnostics/mem_d3g_stage6_500_record_manifest_20260508_082045` with 400 train / 50 validation / 50 test records.
-- The approved 500-record Stage 6 debug/prototype comparison has also run on moncheri `cuda:0`, parallel Option 2A/2B trainer processes, 200 iterations per mode, seed 0, `train_pos_weighted_bce`, no checkpoints/model/HDF5 artifacts. Dedicated thesis_records log: `/home/user/ehsanullahm1/thesis/thesis_records/logs/2026-05-08_mem_d3g_stage6_500_record_parallel_debug_comparison.md`.
-- A follow-up selected-sample prediction-dump diagnostic has run on the same 500-record split for `16/000001001`, `14/000000792`, `13/000000125`, and `13/000000042`, no checkpoints/model/HDF5/full export. Dedicated thesis_records log: `/home/user/ehsanullahm1/thesis/thesis_records/logs/2026-05-08_mem_d3g_stage6_selected_prediction_dump_diagnostic.md`.
-- Do not start a 500-record seed repeat, 1000-record, wonka, checkpoint-writing, thesis-scale, focal/new-loss, or architecture-change run without Ehsan approving machine, device/GPU, configs, records/split, iteration/epoch count, output root, checkpoint policy, and run type.

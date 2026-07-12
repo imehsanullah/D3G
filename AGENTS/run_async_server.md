@@ -40,7 +40,7 @@ This is the pattern used to start Mask R-CNN pretraining on physical GPUs `1` an
 
 ```bash
 tmux new-session -d -s d3g_rcnn_pretrain_gpu12 \
-  "cd /home/user/ehsanullahm1/thesis/D3G && \
+  "cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G && \
    CUDA_VISIBLE_DEVICES=1,2 \
    /home/user/ehsanullahm1/miniconda3/envs/d3g/bin/python main.py \
      --num-gpus 2 \
@@ -63,7 +63,7 @@ Important details:
 Watch the log without attaching to tmux:
 
 ```bash
-tail -f /home/user/ehsanullahm1/thesis/D3G/output/rcnn_pretrain_maskrcnn_base_gpu1_2/train.log
+tail -f /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G/output/rcnn_pretrain_maskrcnn_base_gpu1_2/train.log
 ```
 
 Check GPU usage:

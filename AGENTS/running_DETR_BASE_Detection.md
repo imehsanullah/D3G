@@ -29,7 +29,7 @@ The GPU 0 run was started with:
 
 ```bash
 tmux new-session -d -s d3g_detr_pretrain_base_gpu0 \
-  "cd /home/user/ehsanullahm1/thesis/D3G && \
+  "cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G && \
    CUDA_VISIBLE_DEVICES=0 \
    /home/user/ehsanullahm1/miniconda3/envs/d3g/bin/python main.py \
      --num-gpus 1 \
@@ -110,7 +110,7 @@ Resume the same run from `model_0009999.pth`:
 
 ```bash
 tmux new-session -d -s d3g_detr_pretrain_base_gpu0_resume \
-  "cd /home/user/ehsanullahm1/thesis/D3G && \
+  "cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G && \
    CUDA_VISIBLE_DEVICES=0 \
    /home/user/ehsanullahm1/miniconda3/envs/d3g/bin/python main.py \
      --resume \
