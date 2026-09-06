@@ -14,7 +14,7 @@ DATASETS:
 The repo partition had limited free space, so the actual data was placed on `/tmp` and symlinked back into the repo:
 
 ```bash
-cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G
+cd /home/user/ehsanullahm1/thesis/upstream_research_repositories/scene_graph_related_research_papers/D3G
 mkdir -p /tmp/d3g_datasets /tmp/d3g_downloads
 ln -s /tmp/d3g_datasets datasets
 ```
@@ -54,7 +54,7 @@ conda run -n d3g python -m pip install gdown
 Download metadata into `scene_graph_related_research_papers/D3G/data`:
 
 ```bash
-cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G
+cd /home/user/ehsanullahm1/thesis/upstream_research_repositories/scene_graph_related_research_papers/D3G
 conda run -n d3g gdown --folder \
   https://drive.google.com/drive/folders/1e9_Oa05Cdt5K4aa3rRRf__t5l5ozUeZf \
   -O data
@@ -319,7 +319,7 @@ df -h /tmp
 Verify synthetic mapper:
 
 ```bash
-cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G
+cd /home/user/ehsanullahm1/thesis/upstream_research_repositories/scene_graph_related_research_papers/D3G
 conda run -n d3g python -c "import data; ds=data.metagraspnet_synth_mapper.get_metagraspnet_dict_synth('train'); print('train records', len(ds)); first=next(x for x in ds if x['scene'] < 100); print(first['scene'], first['rgb_path']); mapper=data.metagraspnet_synth_mapper.MetaGraspNetV2Mapper(data_root='./datasets', is_train=False, graph_gt_type='dense'); out=mapper(first); print(out['image'].shape, out['instances'].gt_boxes.tensor.shape, out['dense_gt'].shape)"
 ```
 
@@ -334,7 +334,7 @@ torch.Size([3, 512, 512]) torch.Size([4, 4]) torch.Size([4, 4])
 Verify real mapper:
 
 ```bash
-cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G
+cd /home/user/ehsanullahm1/thesis/upstream_research_repositories/scene_graph_related_research_papers/D3G
 conda run -n d3g python -c "import data; real=data.metagraspnet_real_mapper.get_metagraspnet_dict_real('test_all'); print('real records', len(real)); mapper=data.metagraspnet_real_mapper.MetaGraspNetV2MapperReal(data_root='./datasets', is_train=False, graph_gt_type='dense'); out=mapper(real[0]); print(real[0]['scene'], real[0]['rgb_path']); print(out['image'].shape, out['instances'].gt_boxes.tensor.shape, out['dense_gt'].shape)"
 ```
 

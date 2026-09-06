@@ -7,7 +7,7 @@ This documents the environment setup performed for this project from `scene_grap
 Work from the project root:
 
 ```bash
-cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G
+cd /home/user/ehsanullahm1/thesis/upstream_research_repositories/scene_graph_related_research_papers/D3G
 ```
 
 The README says to create a fresh Python environment and install:
@@ -199,7 +199,7 @@ Example from the README, adjusted to an existing config file:
 
 ```bash
 conda activate d3g
-cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G
+cd /home/user/ehsanullahm1/thesis/upstream_research_repositories/scene_graph_related_research_papers/D3G
 python main.py --config-file configs/detr_base.yaml --data-path /your/data/path
 ```
 
@@ -210,7 +210,7 @@ The README example references `configs/config.yaml`, but this repository current
 The README says to build the optional Deformable DETR op with:
 
 ```bash
-cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G/models/deformable_detr_modules/ops
+cd /home/user/ehsanullahm1/thesis/upstream_research_repositories/scene_graph_related_research_papers/D3G/models/deformable_detr_modules/ops
 conda run -n d3g sh ./make.sh
 conda run -n d3g python ./test.py
 ```
@@ -218,7 +218,7 @@ conda run -n d3g python ./test.py
 The op was built successfully after CUDA PyTorch was installed and GPU visibility was verified:
 
 ```bash
-cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G/models/deformable_detr_modules/ops
+cd /home/user/ehsanullahm1/thesis/upstream_research_repositories/scene_graph_related_research_papers/D3G/models/deformable_detr_modules/ops
 conda run -n d3g sh ./make.sh
 ```
 

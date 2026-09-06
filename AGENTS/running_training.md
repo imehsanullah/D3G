@@ -8,7 +8,7 @@ This project uses a two-stage training flow:
 The full dataset is already available through the repository symlink:
 
 ```bash
-cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G
+cd /home/user/ehsanullahm1/thesis/upstream_research_repositories/scene_graph_related_research_papers/D3G
 ls -l datasets
 ```
 
@@ -51,7 +51,7 @@ checkpoints/pretrain_metagraspnetv2_maskrcnn.pth
 
 ```bash
 conda activate d3g
-cd /home/user/ehsanullahm1/thesis/scene_graph_related_research_papers/D3G
+cd /home/user/ehsanullahm1/thesis/upstream_research_repositories/scene_graph_related_research_papers/D3G
 ```
 
 ## DETR Pipeline
